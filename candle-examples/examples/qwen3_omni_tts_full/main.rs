@@ -51,8 +51,9 @@ struct Args {
     cpu: bool,
 
     /// Maximum generation steps (codec tokens)
-    #[arg(long, default_value_t = 2048)]
-    max_steps: usize,
+    /// Default: auto-calculate based on input length
+    #[arg(long)]
+    max_steps: Option<usize>,
 }
 
 /// Write audio samples to a WAV file
@@ -196,6 +197,15 @@ fn main() -> Result<()> {
     let (_batch, _init_seq, num_codebooks) = initial_tokens.dims3()?;
     println!("  Initial tokens: {:?}", initial_tokens.dims());
 
+    // Calculate max_steps based on input length if not provided
+    // Heuristic: ~2-3 seconds per word at normal speech rate
+    // Empirically: 3 codec frames per input token produces ~1.5s per word
+    let max_steps = args.max_steps.unwrap_or_else(|| {
+        let estimated = token_ids.len() * 3;
+        println!("  Auto max_steps: {} ({}x input tokens)", estimated, 3);
+        estimated.max(5) // Minimum 5 frames
+    });
+
     // Autoregressive generation loop
     let mut all_tokens = vec![initial_tokens.clone()];
     let mut current_tokens = initial_tokens;
@@ -203,7 +213,7 @@ fn main() -> Result<()> {
     // Clear KV cache and feed initial tokens
     talker.clear_kv_cache();
 
-    for step in 0..args.max_steps {
+    for step in 0..max_steps {
         // Generate next token
         let next_logits = talker.forward_logits(&current_tokens)?;
         let (_b, seq, _cb, _vocab) = next_logits.dims4()?;
