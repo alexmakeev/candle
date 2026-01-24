@@ -1,6 +1,6 @@
 //! wgpu storage implementation
 
-use crate::device::WgpuDevice;
+use crate::device::{ShaderType, WgpuDevice};
 use crate::error::WgpuError;
 use candle_core::backend::{BackendDevice, BackendStorage};
 use candle_core::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
@@ -8,6 +8,16 @@ use candle_core::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use candle_core::{CpuStorage, DType, Layout, Result};
 use std::sync::Arc;
 use wgpu::Buffer;
+
+/// Dimensions struct for matmul shader (must match WGSL struct layout)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MatmulDimensions {
+    m: u32,
+    n: u32,
+    k: u32,
+    _padding: u32, // Align to 16 bytes for uniform buffer
+}
 
 /// Storage for tensors on a wgpu device
 #[derive(Debug, Clone)]
@@ -103,6 +113,92 @@ impl WgpuStorage {
         let rhs_cpu = rhs.to_cpu_storage()?;
         let result = f(&lhs_cpu, &rhs_cpu, lhs_layout, rhs_layout)?;
         BackendDevice::storage_from_cpu_storage(&self.device, &result)
+    }
+
+    /// GPU implementation of matrix multiplication
+    /// A[M, K] @ B[K, N] = C[M, N]
+    fn matmul_gpu(&self, rhs: &Self, m: usize, n: usize, k: usize) -> Result<Self> {
+        let output_size = m * n;
+        let output_bytes = output_size * std::mem::size_of::<f32>();
+
+        // Create output buffer
+        let output_buffer = self.device.create_buffer(
+            output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "matmul_output",
+        );
+
+        // Create dimensions uniform buffer
+        let dims = MatmulDimensions {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            _padding: 0,
+        };
+        let dims_bytes = bytemuck::bytes_of(&dims);
+        let dims_buffer = self.device.create_buffer_init(
+            dims_bytes,
+            wgpu::BufferUsages::UNIFORM,
+            "matmul_dims",
+        );
+
+        // Get or compile the matmul pipeline and dispatch
+        self.device.with_pipeline(ShaderType::MatmulF32, |cached| {
+            // Create bind group
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("matmul_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rhs.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: dims_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            // Create command encoder and dispatch compute
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("matmul_encoder"),
+            });
+
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("matmul_pass"),
+                    timestamp_writes: None,
+                });
+
+                compute_pass.set_pipeline(&cached.pipeline);
+                compute_pass.set_bind_group(0, &bind_group, &[]);
+
+                // Dispatch workgroups
+                // Shader uses workgroup_size(16, 16), so we need ceil(M/16) x ceil(N/16) workgroups
+                let workgroups_x = (m as u32 + 15) / 16;
+                let workgroups_y = (n as u32 + 15) / 16;
+                compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+            }
+
+            // Submit commands
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        Ok(WgpuStorage::new(
+            Arc::new(output_buffer),
+            self.device.clone(),
+            output_size,
+            DType::F32,
+        ))
     }
 }
 
@@ -384,10 +480,23 @@ impl BackendStorage for WgpuStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        // TODO: Implement GPU shader for matmul - this is the most critical operation!
-                self.from_cpu_binary_op(rhs, lhs_l, rhs_l, |lhs_cpu, rhs_cpu, ll, rl| {
-            lhs_cpu.matmul(rhs_cpu, bmnk, ll, rl)
-        })
+        let (b, m, n, k) = bmnk;
+
+        // For now, only support F32 and contiguous layouts on GPU
+        // Fall back to CPU for other cases
+        let use_gpu = self.dtype == DType::F32
+            && lhs_l.is_contiguous()
+            && rhs_l.is_contiguous()
+            && b == 1; // Batched matmul not yet supported on GPU
+
+        if !use_gpu {
+            return self.from_cpu_binary_op(rhs, lhs_l, rhs_l, |lhs_cpu, rhs_cpu, ll, rl| {
+                lhs_cpu.matmul(rhs_cpu, bmnk, ll, rl)
+            });
+        }
+
+        // GPU matmul implementation
+        self.matmul_gpu(rhs, m, n, k)
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {

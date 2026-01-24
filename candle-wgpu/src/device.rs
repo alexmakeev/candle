@@ -1,12 +1,48 @@
 //! wgpu device implementation
 
 use crate::error::WgpuError;
+use crate::ops;
+use crate::quantized;
 use crate::storage::WgpuStorage;
 use candle_core::backend::BackendDevice;
 use candle_core::{CpuStorage, DType, DeviceLocation, Result, Shape};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use wgpu::{Adapter, Device, Instance, Queue};
+
+/// Cached compute pipeline with its bind group layout
+#[derive(Debug)]
+pub struct CachedPipeline {
+    pub pipeline: wgpu::ComputePipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+}
+
+/// Shader types for caching
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum ShaderType {
+    MatmulF32,
+    MatmulF16,
+    SoftmaxF32,
+    /// Fused softmax (more efficient than separate ops)
+    SoftmaxFused,
+    LayerNormF32,
+    RopeF32,
+    /// Q8_0 quantized matmul (weights Q8, activations F32)
+    MatmulQ8_0,
+    /// Q8_0 quantized matmul with DP4a (both weights and activations Q8)
+    MatmulQ8_0Dp4a,
+    /// Reduce max along last dimension
+    ReduceMaxLastDim,
+    /// Reduce sum along last dimension
+    ReduceSumLastDim,
+    /// Element-wise exp
+    ExpF32,
+    /// Broadcast subtraction (x - value broadcasted)
+    BroadcastSub,
+    /// Broadcast division (x / value broadcasted)
+    BroadcastDiv,
+}
 
 /// Unique identifier for a wgpu device
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,6 +56,8 @@ pub struct WgpuDevice {
     queue: Arc<Queue>,
     adapter: Arc<Adapter>,
     seed: Mutex<u64>,
+    /// Cache of compiled compute pipelines
+    pipeline_cache: Arc<Mutex<HashMap<ShaderType, CachedPipeline>>>,
 }
 
 impl Clone for WgpuDevice {
@@ -30,6 +68,7 @@ impl Clone for WgpuDevice {
             queue: Arc::clone(&self.queue),
             adapter: Arc::clone(&self.adapter),
             seed: Mutex::new(*self.seed.lock()),
+            pipeline_cache: Arc::clone(&self.pipeline_cache),
         }
     }
 }
@@ -83,6 +122,7 @@ impl WgpuDevice {
             queue: Arc::new(queue),
             adapter,
             seed: Mutex::new(299792458), // speed of light as default seed
+            pipeline_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -124,6 +164,532 @@ impl WgpuDevice {
             contents: data,
             usage,
         })
+    }
+
+    /// Execute a closure with access to the compute pipeline
+    pub fn with_pipeline<F, R>(&self, shader_type: ShaderType, f: F) -> R
+    where
+        F: FnOnce(&CachedPipeline) -> R,
+    {
+        let mut cache = self.pipeline_cache.lock();
+
+        if !cache.contains_key(&shader_type) {
+            let pipeline = self.compile_pipeline(shader_type);
+            cache.insert(shader_type, pipeline);
+        }
+
+        f(cache.get(&shader_type).unwrap())
+    }
+
+    /// Compile a compute pipeline for the given shader type
+    fn compile_pipeline(&self, shader_type: ShaderType) -> CachedPipeline {
+        let (shader_source, label) = match shader_type {
+            ShaderType::MatmulF32 => (ops::MATMUL_SHADER, "matmul_f32"),
+            ShaderType::MatmulF16 => (ops::MATMUL_SHADER, "matmul_f16"), // TODO: F16 shader
+            ShaderType::SoftmaxF32 => (ops::SOFTMAX_SHADER, "softmax_f32"),
+            ShaderType::SoftmaxFused => (ops::SOFTMAX_FUSED_SHADER, "softmax_fused"),
+            ShaderType::LayerNormF32 => (ops::LAYER_NORM_SHADER, "layer_norm_f32"),
+            ShaderType::RopeF32 => (ops::ROPE_SHADER, "rope_f32"),
+            ShaderType::MatmulQ8_0 => (quantized::Q8_0_MATMUL_SHADER, "matmul_q8_0"),
+            ShaderType::MatmulQ8_0Dp4a => (quantized::Q8_0_MATMUL_DP4A_SHADER, "matmul_q8_0_dp4a"),
+            ShaderType::ReduceMaxLastDim => (ops::REDUCE_MAX_LAST_DIM_SHADER, "reduce_max_last_dim"),
+            ShaderType::ReduceSumLastDim => (ops::REDUCE_SUM_LAST_DIM_SHADER, "reduce_sum_last_dim"),
+            ShaderType::ExpF32 => (ops::EXP_SHADER, "exp_f32"),
+            ShaderType::BroadcastSub => (ops::BROADCAST_SUB_SHADER, "broadcast_sub"),
+            ShaderType::BroadcastDiv => (ops::BROADCAST_DIV_SHADER, "broadcast_div"),
+        };
+
+        let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
+
+        // Create bind group layout based on shader type
+        let bind_group_layout = match shader_type {
+            ShaderType::MatmulF32 | ShaderType::MatmulF16 => {
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // A matrix (input)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // B matrix (input)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // C matrix (output)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Dimensions (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ShaderType::MatmulQ8_0 => {
+                // Q8_0 matmul: weights (Q8), input (F32), output (F32), params
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // Weights (Q8_0 blocks)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Input (F32)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Output (F32)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ShaderType::MatmulQ8_0Dp4a => {
+                // Q8_0 DP4a: weights (Q8), input (Q8), input_scales, output, params
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // Weights Q8
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Input Q8
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Input scales
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Output
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Params
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ShaderType::ReduceMaxLastDim | ShaderType::ReduceSumLastDim => {
+                // Reduce ops: input, output, params
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // Input
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Output
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ShaderType::SoftmaxFused => {
+                // Fused softmax: input, output, params
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // Input
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Output
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ShaderType::ExpF32 => {
+                // Exp: input, output, params
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // Input
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Output
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ShaderType::BroadcastSub | ShaderType::BroadcastDiv => {
+                // Broadcast ops: input, value, output, params
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // Input
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Value (broadcast source)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Output
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ShaderType::RopeF32 => {
+                // RoPE: q (in/out), cos_cache, sin_cache, params
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // Q tensor (read_write)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Cos cache
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Sin cache
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ShaderType::LayerNormF32 => {
+                // LayerNorm: input, gamma, beta, output, params
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // Input
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Gamma
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Beta
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Output
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            _ => {
+                // Generic layout for other shaders - can be specialized later
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[],
+                })
+            }
+        };
+
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("{}_pipeline_layout", label)),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(&format!("{}_pipeline", label)),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        CachedPipeline {
+            pipeline,
+            bind_group_layout,
+        }
     }
 }
 
