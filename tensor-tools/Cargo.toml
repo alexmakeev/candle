@@ -10,6 +10,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+byteorder = { workspace = true }
 candle = { workspace = true }
 clap = { workspace = true }
 rayon = { workspace = true }

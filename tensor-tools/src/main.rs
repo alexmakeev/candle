@@ -1,3 +1,5 @@
+mod streaming_quantize;
+
 use candle::quantized::{gguf_file, GgmlDType, QTensor};
 use candle::{Device, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -159,6 +161,27 @@ enum Command {
         /// The output file, in safetensors format.
         #[arg(long)]
         out_file: std::path::PathBuf,
+    },
+
+    /// Streaming quantization for large models (low memory usage)
+    ///
+    /// Processes tensors one at a time instead of loading the entire model.
+    /// Peak memory usage: ~2x largest tensor instead of full model.
+    StreamQuantize {
+        /// The input file(s), in safetensors format.
+        in_file: Vec<std::path::PathBuf>,
+
+        /// The output file, in gguf format.
+        #[arg(long)]
+        out_file: std::path::PathBuf,
+
+        /// The quantization schema to apply.
+        #[arg(long, value_enum, default_value = "q8_0")]
+        quantization: Quantization,
+
+        /// Estimate output size without actually quantizing.
+        #[arg(long)]
+        estimate_only: bool,
     },
 }
 
@@ -537,6 +560,22 @@ fn main() -> anyhow::Result<()> {
             mode,
         } => run_quantize(&in_file, out_file, quantization, mode, &device)?,
         Command::Dequantize { in_file, out_file } => run_dequantize(in_file, out_file, &device)?,
+        Command::StreamQuantize {
+            in_file,
+            out_file,
+            quantization,
+            estimate_only,
+        } => {
+            let dtype = quantization.dtype();
+            if estimate_only {
+                let (original, quantized) = streaming_quantize::estimate_size(&in_file, dtype)?;
+                println!("Original size (BF16):  {:.2} GB", original as f64 / 1e9);
+                println!("Quantized size ({:?}): {:.2} GB", dtype, quantized as f64 / 1e9);
+                println!("Compression ratio:     {:.2}x", original as f64 / quantized as f64);
+            } else {
+                streaming_quantize::streaming_quantize(&in_file, &out_file, dtype)?;
+            }
+        }
     }
     Ok(())
 }
