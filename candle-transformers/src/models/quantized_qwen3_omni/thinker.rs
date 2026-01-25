@@ -537,10 +537,42 @@ impl Thinker {
         self.lm_head.forward(&hidden)
     }
 
+
+    /// Forward pass with pre-combined embeddings
+    /// Use this when you need custom embedding sequences (e.g., text + audio + text)
+    pub fn forward_embeddings(&mut self, embeddings: &Tensor) -> Result<ThinkerOutput> {
+        let seq_len = embeddings.dim(1)?;
+
+        // Create causal mask
+        let mask = self.causal_mask(seq_len, 0)?;
+
+        // Process through layers
+        let mut hidden = embeddings.clone();
+        for layer in &mut self.layers {
+            hidden = layer.forward(&hidden, &self.rotary, Some(&mask), 0)?;
+        }
+
+        hidden = self.norm.forward(&hidden)?;
+
+        // Generate text logits
+        let text_logits = self.lm_head.forward(&hidden)?;
+
+        Ok(ThinkerOutput {
+            text_logits,
+            hidden_states: hidden,
+        })
+    }
+
     /// Clear KV cache
     pub fn clear_kv_cache(&mut self) {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
+    }
+
+    /// Get raw token embeddings without running through transformer
+    /// Useful for getting TTS special token embeddings
+    pub fn embed_tokens(&self, token_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(token_ids)
     }
 }

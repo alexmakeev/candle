@@ -23,10 +23,63 @@ use candle::{DType, Device, Module, Result, Tensor, D};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
+/// Causal Conv1d with left-only padding
+/// Implements: pad_left(x, kernel_size - 1) -> conv(x)
+struct CausalConv1d {
+    conv: candle_nn::Conv1d,
+    left_padding: usize,
+}
+
+impl CausalConv1d {
+    fn new(conv: candle_nn::Conv1d, kernel_size: usize) -> Self {
+        Self {
+            conv,
+            left_padding: kernel_size - 1, // causal padding = kernel_size - stride (stride=1)
+        }
+    }
+}
+
+impl Module for CausalConv1d {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // Pad left only: [B, C, T] -> [B, C, padding + T]
+        let padded = xs.pad_with_zeros(2, self.left_padding, 0)?;
+        self.conv.forward(&padded)
+    }
+}
+
+/// Causal Conv1d with dilation support
+/// For dilated causal conv: left_pad = (kernel_size - 1) * dilation
+struct CausalDilatedConv1d {
+    conv: candle_nn::Conv1d,
+    left_padding: usize,
+}
+
+impl CausalDilatedConv1d {
+    fn new(conv: candle_nn::Conv1d, kernel_size: usize, dilation: usize) -> Self {
+        Self {
+            conv,
+            left_padding: (kernel_size - 1) * dilation, // causal padding with dilation
+        }
+    }
+}
+
+impl Module for CausalDilatedConv1d {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // Pad left only: [B, C, T] -> [B, C, padding + T]
+        let padded = xs.pad_with_zeros(2, self.left_padding, 0)?;
+        self.conv.forward(&padded)
+    }
+}
+
 /// Snake activation: x + (1/alpha) * sin^2(alpha * x)
 /// Used in SnakeBeta: x + (1/beta) * sin^2(alpha * x)
+///
+/// BigVGAN uses log-scale parameterization where alpha/beta are stored as log values.
+/// The actual alpha/beta = exp(stored_value).
 struct SnakeBeta {
+    /// Log-scale alpha parameter (need to exp() before use)
     alpha: Tensor,
+    /// Log-scale beta parameter (need to exp() before use)
     beta: Tensor,
 }
 
@@ -39,9 +92,15 @@ impl SnakeBeta {
 impl Module for SnakeBeta {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         // x + (1/beta) * sin^2(alpha * x)
+        // BigVGAN stores alpha/beta in log-scale, so we need exp()
         // For Conv1d: xs is [B, C, T], alpha/beta are [C]
-        let alpha = self.alpha.unsqueeze(0)?.unsqueeze(D::Minus1)?; // [1, C, 1]
-        let beta = self.beta.unsqueeze(0)?.unsqueeze(D::Minus1)?;
+
+        // Apply exp() to convert from log-scale to actual values
+        let alpha_exp = self.alpha.exp()?;
+        let beta_exp = self.beta.exp()?;
+
+        let alpha = alpha_exp.unsqueeze(0)?.unsqueeze(D::Minus1)?; // [1, C, 1]
+        let beta = beta_exp.unsqueeze(0)?.unsqueeze(D::Minus1)?;
 
         let sin_part = (xs.broadcast_mul(&alpha)?.sin())?;
         let sin_sq = (&sin_part * &sin_part)?;
@@ -232,12 +291,12 @@ impl ConvNeXtBlock {
     }
 }
 
-/// HiFi-GAN residual block with Snake activation
+/// HiFi-GAN residual block with Snake activation and causal convolutions
 struct ResidualBlock {
     act1: SnakeBeta,
-    conv1: candle_nn::Conv1d,
+    conv1: CausalDilatedConv1d, // Causal conv with dilation
     act2: SnakeBeta,
-    conv2: candle_nn::Conv1d,
+    conv2: candle_nn::Conv1d, // kernel_size=1, no padding needed
 }
 
 impl ResidualBlock {
@@ -283,14 +342,14 @@ pub struct Code2Wav {
     rotary: Arc<RotaryEmbedding>,
     /// Upsample blocks (ConvNeXt)
     upsample_blocks: Vec<ConvNeXtBlock>,
-    /// Initial conv before decoder
-    initial_conv: candle_nn::Conv1d,
+    /// Initial causal conv before decoder (kernel_size=7)
+    initial_conv: CausalConv1d,
     /// Decoder blocks (HiFi-GAN style)
     decoder_blocks: Vec<DecoderBlock>,
     /// Final snake activation
     final_snake: SnakeBeta,
-    /// Final conv to mono
-    final_conv: candle_nn::Conv1d,
+    /// Final causal conv to mono (kernel_size=7)
+    final_conv: CausalConv1d,
     /// Config
     #[allow(dead_code)]
     cfg: Code2WavConfig,
@@ -426,19 +485,20 @@ impl Code2Wav {
             });
         }
 
-        // Initial conv (decoder.0)
+        // Initial causal conv (decoder.0) - kernel_size=7
         let initial_conv_cfg = candle_nn::Conv1dConfig {
             stride: 1,
-            padding: 3, // kernel=7
+            padding: 0, // No padding in Conv1d, we'll handle it ourselves
             dilation: 1,
             groups: 1,
             ..Default::default()
         };
-        let initial_conv = gg.conv1d(
+        let initial_conv_inner = gg.conv1d(
             &format!("{prefix}.decoder.0.conv.weight"),
             &format!("{prefix}.decoder.0.conv.bias"),
             initial_conv_cfg,
         )?;
+        let initial_conv = CausalConv1d::new(initial_conv_inner, 7);
 
         // Decoder blocks (decoder.1 through decoder.4)
         // Each block: snake + transpose conv + 3 residual blocks
@@ -481,18 +541,20 @@ impl Code2Wav {
                 let act1 = SnakeBeta::new(act1_alpha, act1_beta);
 
                 let dilation = 3usize.pow(r as u32);
+                // Causal conv1: kernel=7, left_pad = (kernel-1)*dilation, right_pad = 0
                 let conv1_cfg = candle_nn::Conv1dConfig {
                     stride: 1,
-                    padding: dilation * 3, // kernel=7
+                    padding: 0, // No padding in Conv1d, CausalDilatedConv1d handles it
                     dilation,
                     groups: 1,
                     ..Default::default()
                 };
-                let conv1 = gg.conv1d(
+                let conv1_inner = gg.conv1d(
                     &format!("{res_prefix}.conv1.conv.weight"),
                     &format!("{res_prefix}.conv1.conv.bias"),
                     conv1_cfg,
                 )?;
+                let conv1 = CausalDilatedConv1d::new(conv1_inner, 7, dilation);
 
                 let act2_alpha = gg.dequantize_f32(&format!("{res_prefix}.act2.alpha"))?;
                 let act2_beta = gg.dequantize_f32(&format!("{res_prefix}.act2.beta"))?;
@@ -531,18 +593,20 @@ impl Code2Wav {
         let final_beta = gg.dequantize_f32(&format!("{prefix}.decoder.5.beta"))?;
         let final_snake = SnakeBeta::new(final_alpha, final_beta);
 
+        // Final causal conv (decoder.6) - kernel_size=7
         let final_conv_cfg = candle_nn::Conv1dConfig {
             stride: 1,
-            padding: 3, // kernel=7
+            padding: 0, // No padding in Conv1d, we'll handle it ourselves
             dilation: 1,
             groups: 1,
             ..Default::default()
         };
-        let final_conv = gg.conv1d(
+        let final_conv_inner = gg.conv1d(
             &format!("{prefix}.decoder.6.conv.weight"),
             &format!("{prefix}.decoder.6.conv.bias"),
             final_conv_cfg,
         )?;
+        let final_conv = CausalConv1d::new(final_conv_inner, 7);
 
         Ok(Self {
             code_embedding,
@@ -562,47 +626,71 @@ impl Code2Wav {
     /// Convert codec tokens to audio waveform
     ///
     /// # Arguments
-    /// * `codec_tokens` - Token IDs [batch, seq]
+    /// * `codec_tokens` - Token IDs [batch, num_codebooks, seq_len]
+    ///   Each codebook's tokens will be offset by codebook_idx * codebook_size
     ///
     /// # Returns
     /// * Audio waveform [batch, samples]
-    pub fn forward(&self, codec_tokens: &Tensor) -> Result<Tensor> {
-        let (_b, _seq) = codec_tokens.dims2()?;
+    /// Convert codec tokens to audio waveform with codebook offset
+    ///
+    /// # Arguments
+    /// *  - Token IDs [batch, num_codebooks, seq_len]
+    /// *  - Starting codebook index for offset calculation
+    ///   Talker outputs codebooks 0-14, but Code2Wav expects 1-15, so use start_codebook=1
+    ///
+    /// # Returns
+    /// * Audio waveform [batch, samples]
+    pub fn forward_with_offset(&self, codec_tokens: &Tensor, start_codebook: usize) -> Result<Tensor> {
+        let (b, num_cb, seq_len) = codec_tokens.dims3()?;
 
-        // Embed tokens: [batch, seq] -> [batch, seq, embed_dim]
-        let mut xs = self.code_embedding.forward(codec_tokens)?;
+        let codebook_size = self.cfg.codebook_size as u32;
 
-        // Pre-transformer layers
+        let mut sum_embed: Option<Tensor> = None;
+        for cb_idx in 0..num_cb {
+            let cb_tokens = codec_tokens.narrow(1, cb_idx, 1)?.squeeze(1)?;
+
+            // Add offset: token + (start_codebook + cb_idx) * codebook_size
+            let offset = Tensor::full((start_codebook as u32 + cb_idx as u32) * codebook_size, (b, seq_len), codec_tokens.device())?;
+            let offset_tokens = (cb_tokens + offset)?;
+            
+            let embedded = self.code_embedding.forward(&offset_tokens)?;
+
+            sum_embed = Some(match sum_embed {
+                Some(acc) => (acc + embedded)?,
+                None => embedded,
+            });
+        }
+
+        let mut xs = (sum_embed.unwrap() / num_cb as f64)?;
+
         for layer in &self.pre_transformer_layers {
             xs = layer.forward(&xs, &self.rotary)?;
         }
         xs = self.pre_transformer_norm.forward(&xs)?;
 
-        // Transpose for conv: [B, T, C] -> [B, C, T]
         xs = xs.transpose(1, 2)?;
 
-        // Upsample blocks
         for block in &self.upsample_blocks {
             xs = block.forward(&xs)?;
         }
 
-        // Initial decoder conv
         xs = self.initial_conv.forward(&xs)?;
 
-        // Decoder blocks (HiFi-GAN)
         for block in &self.decoder_blocks {
             xs = block.forward(&xs)?;
         }
 
-        // Final activation and conv
         xs = self.final_snake.forward(&xs)?;
         xs = self.final_conv.forward(&xs)?;
 
-        // Apply tanh for audio normalization
         let xs = xs.tanh()?;
 
-        // Squeeze channel dim: [batch, 1, samples] -> [batch, samples]
         xs.squeeze(1)
+    }
+
+    /// Convert codec tokens to audio waveform (assumes codebook offset 0)
+    pub fn forward(&self, codec_tokens: &Tensor) -> Result<Tensor> {
+        self.forward_with_offset(codec_tokens, 0)
     }
 }
 
@@ -615,6 +703,7 @@ mod tests {
         let cfg = Code2WavConfig::default();
         assert_eq!(cfg.embedding_dim, 1024);
         assert_eq!(cfg.num_transformer_layers, 8);
-        assert_eq!(cfg.num_codebooks, 8);
+        assert_eq!(cfg.num_codebooks, 16);
+        assert_eq!(cfg.codebook_size, 2048);
     }
 }

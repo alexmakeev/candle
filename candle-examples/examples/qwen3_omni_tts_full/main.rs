@@ -17,7 +17,7 @@
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_transformers::models::quantized_qwen3_omni::{
-    Code2Wav, Code2WavConfig, Gguf, Talker, TalkerConfig, Thinker, ThinkerConfig,
+    Code2Wav, Code2WavConfig, Gguf, Speaker, Talker, TalkerConfig, Thinker, ThinkerConfig,
 };
 use clap::Parser;
 use std::fs::File;
@@ -25,7 +25,11 @@ use std::io::{BufReader, BufWriter, Write};
 use tokenizers::Tokenizer;
 
 const SAMPLE_RATE: u32 = 24000;
-const STOP_TOKEN: u32 = 2150; // Stop token for codec generation (from Qwen3-Omni config)
+
+// TTS special token IDs from Thinker embed_tokens
+const TTS_BOS_TOKEN_ID: u32 = 151672;
+const TTS_EOS_TOKEN_ID: u32 = 151673;
+const TTS_PAD_TOKEN_ID: u32 = 151671;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Qwen3-Omni TTS: Text to Speech")]
@@ -51,9 +55,12 @@ struct Args {
     cpu: bool,
 
     /// Maximum generation steps (codec tokens)
-    /// Default: auto-calculate based on input length
-    #[arg(long)]
-    max_steps: Option<usize>,
+    #[arg(long, default_value_t = 500)]
+    max_steps: usize,
+
+    /// Speaker voice (ethan, chelsie, aiden)
+    #[arg(long, default_value = "ethan")]
+    speaker: String,
 }
 
 /// Write audio samples to a WAV file
@@ -168,6 +175,18 @@ fn main() -> Result<()> {
     if !talker.has_hidden_projection() {
         anyhow::bail!("Talker missing hidden_projection - cannot connect to Thinker");
     }
+    if !talker.has_text_projection() {
+        anyhow::bail!("Talker missing text_projection - needed for proper TTS initialization");
+    }
+
+    // Parse speaker
+    let speaker = match args.speaker.to_lowercase().as_str() {
+        "ethan" => Speaker::Ethan,
+        "chelsie" => Speaker::Chelsie,
+        "aiden" => Speaker::Aiden,
+        _ => anyhow::bail!("Unknown speaker: {}. Use ethan, chelsie, or aiden", args.speaker),
+    };
+    println!("  Speaker: {:?}", speaker);
 
     println!("\nLoading Code2Wav vocoder...");
     let start = std::time::Instant::now();
@@ -177,7 +196,7 @@ fn main() -> Result<()> {
     // Run pipeline
     println!("\n=== Running TTS Pipeline ===\n");
 
-    // Step 1: Thinker forward
+    // Step 1: Thinker forward pass to get embeddings
     println!("Step 1: Thinker forward pass...");
     let input_tensor = Tensor::from_slice(&token_ids, (1, token_ids.len()), &device)?;
     let start = std::time::Instant::now();
@@ -188,63 +207,30 @@ fn main() -> Result<()> {
         start.elapsed().as_secs_f64()
     );
 
-    // Step 2: Talker autoregressive codec generation
-    println!("\nStep 2: Talker codec generation (autoregressive)...");
+    // Get TTS special token embeddings from Thinker embed_tokens
+    // These are tokens: tts_bos (151672), tts_eos (151673), tts_pad (151671)
+    println!("\nStep 1b: Getting TTS special token embeddings...");
+    let tts_special_token_ids = Tensor::from_slice(
+        &[TTS_BOS_TOKEN_ID, TTS_EOS_TOKEN_ID, TTS_PAD_TOKEN_ID],
+        (1, 3),
+        &device,
+    )?;
+    // Get raw embeddings from Thinker's embed_tokens layer
+    let tts_special_embeds = thinker.embed_tokens(&tts_special_token_ids)?.squeeze(0)?; // [3, 2048]
+    println!("  TTS special embeds: {:?}", tts_special_embeds.dims());
+
+    // Step 2: Talker codec generation with proper speaker initialization
+    println!("\nStep 2: Talker codec generation with speaker {:?}...", speaker);
     let start = std::time::Instant::now();
 
-    // Get initial codec tokens from hidden states
-    let initial_tokens = talker.forward_from_hidden(&thinker_output.hidden_states)?;
-    let (_batch, _init_seq, num_codebooks) = initial_tokens.dims3()?;
-    println!("  Initial tokens: {:?}", initial_tokens.dims());
+    let codec_tokens = talker.generate_with_speaker(
+        &thinker_output.hidden_states,
+        &tts_special_embeds,
+        speaker,
+        args.max_steps,
+    )?;
 
-    // Calculate max_steps based on input length if not provided
-    // Heuristic: ~2-3 seconds per word at normal speech rate
-    // Empirically: 3 codec frames per input token produces ~1.5s per word
-    let max_steps = args.max_steps.unwrap_or_else(|| {
-        let estimated = token_ids.len() * 3;
-        println!("  Auto max_steps: {} ({}x input tokens)", estimated, 3);
-        estimated.max(5) // Minimum 5 frames
-    });
-
-    // Autoregressive generation loop
-    let mut all_tokens = vec![initial_tokens.clone()];
-    let mut current_tokens = initial_tokens;
-
-    // Clear KV cache and feed initial tokens
-    talker.clear_kv_cache();
-
-    for step in 0..max_steps {
-        // Generate next token
-        let next_logits = talker.forward_logits(&current_tokens)?;
-        let (_b, seq, _cb, _vocab) = next_logits.dims4()?;
-
-        // Take last position logits
-        let last_logits = next_logits.narrow(1, seq - 1, 1)?;
-
-        // Greedy decode for each codebook
-        let next_tokens = last_logits.argmax(3)?.to_dtype(DType::U32)?;
-
-        // Check for STOP token (token 2150 in any codebook)
-        let tokens_cpu = next_tokens.to_device(&Device::Cpu)?.flatten_all()?;
-        let tokens_vec: Vec<u32> = tokens_cpu.to_vec1()?;
-        if tokens_vec.iter().any(|&t| t == STOP_TOKEN) {
-            println!("  STOP token detected at step {}", step);
-            break;
-        }
-
-        all_tokens.push(next_tokens.clone());
-        current_tokens = next_tokens;
-
-        if (step + 1) % 50 == 0 {
-            print!(".");
-            std::io::Write::flush(&mut std::io::stdout())?;
-        }
-    }
-    println!();
-
-    // Concatenate all tokens
-    let codec_tokens = Tensor::cat(&all_tokens, 1)?;
-    let (batch, seq_len, _) = codec_tokens.dims3()?;
+    let (_batch, seq_len, num_codebooks) = codec_tokens.dims3()?;
     println!(
         "  Codec tokens: {:?} ({:.2}s)",
         codec_tokens.dims(),
@@ -255,36 +241,47 @@ fn main() -> Result<()> {
         seq_len, num_codebooks
     );
 
-    // Convert multi-codebook tokens to flat format for Code2Wav
-    // Code2Wav uses 8 codebooks, but Talker outputs 15 codebooks
-    // We use the first 8 codebooks from Talker output
-    let code2wav_num_codebooks = 8;
-    let code2wav_codebook_size = 4096u32; // From Code2WavConfig
-
-    let mut flat_tokens: Vec<u32> = Vec::with_capacity(seq_len * code2wav_num_codebooks);
-
+    // Debug: print first few tokens
     let codec_cpu = codec_tokens.to_device(&Device::Cpu)?;
-    for pos in 0..seq_len {
-        for cb in 0..code2wav_num_codebooks {
-            let token: u32 = codec_cpu.get(0)?.get(pos)?.get(cb)?.to_scalar()?;
-            // Add codebook offset for Code2Wav embedding
-            flat_tokens.push(token + cb as u32 * code2wav_codebook_size);
+    println!("\n  First 5 positions of codec tokens:");
+    for pos in 0..5.min(seq_len) {
+        let mut tokens_str = String::new();
+        for cb in 0..num_codebooks.min(8) {
+            let t: u32 = codec_cpu.get(0)?.get(pos)?.get(cb)?.to_scalar()?;
+            tokens_str.push_str(&format!("{} ", t));
         }
+        println!("    pos {}: {}", pos, tokens_str);
     }
-    // DEBUG: Print token statistics
-    println!("\nDEBUG: flat_tokens stats:");
-    let flat_min = flat_tokens.iter().min().unwrap();
-    let flat_max = flat_tokens.iter().max().unwrap();
-    println!("  Count: {}", flat_tokens.len());
-    println!("  Range: [{}, {}]", flat_min, flat_max);
-    println!("  Expected: [0, {}]", code2wav_num_codebooks as u32 * code2wav_codebook_size - 1);
 
-    let codec_flat = Tensor::from_slice(&flat_tokens, (batch, seq_len * code2wav_num_codebooks), &device)?;
+    // Debug: check token range
+    let codec_flat = codec_cpu.flatten_all()?;
+    let codec_vec: Vec<u32> = codec_flat.to_vec1()?;
+    let max_token = codec_vec.iter().max().unwrap_or(&0);
+    let min_token = codec_vec.iter().min().unwrap_or(&0);
+    println!("  Token range: {} - {}", min_token, max_token);
+    let over_2048: Vec<_> = codec_vec.iter().filter(|&&t| t >= 2048).collect();
+    println!("  Tokens >= 2048: {} out of {}", over_2048.len(), codec_vec.len());
+    if !over_2048.is_empty() && over_2048.len() <= 10 {
+        println!("  Over-threshold values: {:?}", over_2048);
+    }
 
-    // Step 3: Code2Wav synthesis
+    // Transpose from [batch, seq, codebooks] to [batch, codebooks, seq] for Code2Wav
+    // Talker generates codebooks 0-14, which map to Code2Wav codebooks 1-15
+    // Use forward_with_offset(tokens, 1) to add correct offset
+    let codec_transposed = codec_tokens.transpose(1, 2)?; // [1, 15, seq]
+    println!("  Codec for vocoder: {:?}", codec_transposed.dims());
+    
+    // Debug: check range in transposed tensor
+    let trans_flat = codec_transposed.flatten_all()?;
+    let trans_vec: Vec<u32> = trans_flat.to_vec1()?;
+    let trans_max = trans_vec.iter().max().unwrap_or(&0);
+    let trans_min = trans_vec.iter().min().unwrap_or(&0);
+    println!("  Transposed range: {} - {}", trans_min, trans_max);
+
+    // Step 3: Code2Wav synthesis (with offset 1 for Talker codebooks)
     println!("\nStep 3: Code2Wav audio synthesis...");
     let start = std::time::Instant::now();
-    let audio = code2wav.forward(&codec_flat)?;
+    let audio = code2wav.forward_with_offset(&codec_transposed, 0)?;
     println!(
         "  Audio shape: {:?} ({:.2}s)",
         audio.dims(),

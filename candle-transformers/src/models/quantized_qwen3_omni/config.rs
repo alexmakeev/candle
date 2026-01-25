@@ -46,7 +46,7 @@ impl Default for AudioTowerConfig {
         Self {
             hidden_size: 1280,
             num_hidden_layers: 32,
-            num_attention_heads: 16,
+            num_attention_heads: 20,
             intermediate_size: 5120,
             conv_channels: 480,
             output_size: 2048,
@@ -188,8 +188,8 @@ impl Default for Code2WavConfig {
         Self {
             embedding_dim: 1024,
             // 32768 / 4096 = 8 codebooks based on GGUF
-            num_codebooks: 8,
-            codebook_size: 4096,
+            num_codebooks: 16,
+            codebook_size: 2048,
             num_transformer_layers: 8,
             num_attention_heads: 8,
             intermediate_size: 3072, // 1024 * 3

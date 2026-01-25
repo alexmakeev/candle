@@ -6,6 +6,8 @@
 //! GGUF tensor structure:
 //! - talker.hidden_projection.linear_fc1.{weight,bias}: [2048, 2048] Q8_0 / F32
 //! - talker.hidden_projection.linear_fc2.{weight,bias}: [1024, 2048] Q8_0 / F32
+//! - talker.text_projection.linear_fc1.{weight,bias}: [2048, 2048] Q8_0 / F32
+//! - talker.text_projection.linear_fc2.{weight,bias}: [1024, 2048] Q8_0 / F32
 //! - talker.code_predictor.model.codec_embedding.{0-14}.weight: [2048, 1024] Q8_0
 //! - talker.code_predictor.model.layers.{N}.self_attn.{q,k,v,o}_proj.weight: Q8_0
 //! - talker.code_predictor.model.layers.{N}.self_attn.{q,k}_norm.weight: F32
@@ -241,16 +243,17 @@ impl CodecEmbedding {
     }
 }
 
-/// Hidden projection MLP: projects Thinker hidden states to Talker hidden size
+/// Projection MLP: projects Thinker hidden states to Talker hidden size
 /// fc1: 2048 → 2048, fc2: 2048 → 1024
-struct HiddenProjection {
+/// Used for both hidden_projection (multimodal) and text_projection (text)
+struct ProjectionMlp {
     fc1: QMatMul,
     fc1_bias: Tensor,
     fc2: QMatMul,
     fc2_bias: Tensor,
 }
 
-impl HiddenProjection {
+impl ProjectionMlp {
     /// Forward: project from Thinker hidden (2048) to Talker hidden (1024)
     /// Uses SiLU activation between fc1 and fc2
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
@@ -262,6 +265,50 @@ impl HiddenProjection {
         // fc2: [B, S, 2048] → [B, S, 1024]
         let x = self.fc2.forward(&x)?;
         x.broadcast_add(&self.fc2_bias)
+    }
+}
+
+/// Special token IDs for Talker codec embedding
+/// From HuggingFace Qwen3-Omni config
+pub struct TalkerSpecialTokens {
+    /// No-think token for non-thinking mode
+    pub codec_nothink_id: u32,
+    /// Think begin-of-sequence token
+    pub codec_think_bos_id: u32,
+    /// Think end-of-sequence token
+    pub codec_think_eos_id: u32,
+    /// Padding token for codec
+    pub codec_pad_id: u32,
+    /// Begin-of-sequence token for codec
+    pub codec_bos_id: u32,
+    /// End-of-sequence token for codec
+    pub codec_eos_id: u32,
+}
+
+impl Default for TalkerSpecialTokens {
+    fn default() -> Self {
+        Self {
+            codec_nothink_id: 2155,
+            codec_think_bos_id: 2156,
+            codec_think_eos_id: 2157,
+            codec_pad_id: 2148,
+            codec_bos_id: 2149,
+            codec_eos_id: 2150,
+        }
+    }
+}
+
+/// Speaker IDs for TTS
+#[derive(Debug, Clone, Copy)]
+pub enum Speaker {
+    Chelsie = 2301,
+    Ethan = 2302,
+    Aiden = 2303,
+}
+
+impl Speaker {
+    pub fn id(&self) -> u32 {
+        *self as u32
     }
 }
 
@@ -303,9 +350,13 @@ impl LmHeads {
 
 /// Quantized Talker: speech synthesis model
 pub struct Talker {
-    /// Hidden projection: Thinker hidden (2048) → Talker hidden (1024)
-    hidden_projection: Option<HiddenProjection>,
-    /// Codec embeddings (15 codebooks)
+    /// Hidden projection: Thinker hidden (2048) → Talker hidden (1024) for multimodal
+    hidden_projection: Option<ProjectionMlp>,
+    /// Text projection: Thinker hidden (2048) → Talker hidden (1024) for text
+    text_projection: Option<ProjectionMlp>,
+    /// Special codec embedding from talker.model (vocab_size=3072, for special tokens 2148-2302)
+    special_codec_embedding: Option<candle_nn::Embedding>,
+    /// Codec embeddings (15 codebooks) from code_predictor
     codec_embedding: CodecEmbedding,
     /// Transformer layers
     layers: Vec<DecoderLayer>,
@@ -315,6 +366,8 @@ pub struct Talker {
     lm_heads: LmHeads,
     /// Rotary embedding
     rotary: Arc<RotaryEmbedding>,
+    /// Special tokens for codec
+    special_tokens: TalkerSpecialTokens,
     /// Config
     cfg: TalkerConfig,
     /// Device
@@ -333,18 +386,42 @@ impl Talker {
         let prefix = "talker.code_predictor";
         let dtype = DType::F32;
 
-        // Load hidden projection (Thinker 2048 → Talker 1024)
+        // Load hidden projection (Thinker 2048 → Talker 1024) for multimodal
         let hidden_projection = if gg.has_tensor("talker.hidden_projection.linear_fc1.weight") {
             let fc1 = gg.qmatmul("talker.hidden_projection.linear_fc1.weight")?;
             let fc1_bias = gg.dequantize_f32("talker.hidden_projection.linear_fc1.bias")?;
             let fc2 = gg.qmatmul("talker.hidden_projection.linear_fc2.weight")?;
             let fc2_bias = gg.dequantize_f32("talker.hidden_projection.linear_fc2.bias")?;
-            Some(HiddenProjection {
+            Some(ProjectionMlp {
                 fc1,
                 fc1_bias,
                 fc2,
                 fc2_bias,
             })
+        } else {
+            None
+        };
+
+        // Load text projection (Thinker 2048 → Talker 1024) for text tokens
+        let text_projection = if gg.has_tensor("talker.text_projection.linear_fc1.weight") {
+            let fc1 = gg.qmatmul("talker.text_projection.linear_fc1.weight")?;
+            let fc1_bias = gg.dequantize_f32("talker.text_projection.linear_fc1.bias")?;
+            let fc2 = gg.qmatmul("talker.text_projection.linear_fc2.weight")?;
+            let fc2_bias = gg.dequantize_f32("talker.text_projection.linear_fc2.bias")?;
+            Some(ProjectionMlp {
+                fc1,
+                fc1_bias,
+                fc2,
+                fc2_bias,
+            })
+        } else {
+            None
+        };
+
+        // Load special codec embedding from talker.model (vocab_size=3072)
+        // This is for special tokens like speaker_id, codec_bos, codec_pad, etc.
+        let special_codec_embedding = if gg.has_tensor("talker.model.codec_embedding.weight") {
+            Some(gg.embedding("talker.model.codec_embedding.weight", cfg.hidden_size)?)
         } else {
             None
         };
@@ -436,11 +513,14 @@ impl Talker {
 
         Ok(Self {
             hidden_projection,
+            text_projection,
+            special_codec_embedding,
             codec_embedding,
             layers,
             norm,
             lm_heads,
             rotary,
+            special_tokens: TalkerSpecialTokens::default(),
             cfg: cfg.clone(),
             device: device.clone(),
             dtype,
@@ -600,6 +680,250 @@ impl Talker {
     /// Check if hidden_projection is loaded
     pub fn has_hidden_projection(&self) -> bool {
         self.hidden_projection.is_some()
+    }
+
+    /// Check if text_projection is loaded
+    pub fn has_text_projection(&self) -> bool {
+        self.text_projection.is_some()
+    }
+
+    /// Project text embeddings from Thinker to Talker hidden size
+    pub fn text_projection(&self, thinker_embeds: &Tensor) -> Result<Tensor> {
+        match &self.text_projection {
+            Some(proj) => proj.forward(thinker_embeds),
+            None => Err(candle::Error::Msg(
+                "text_projection not loaded".into(),
+            )),
+        }
+    }
+
+    /// Get codec embedding for special tokens (speaker, bos, pad, etc.)
+    /// Uses talker.model.codec_embedding (vocab_size=3072)
+    /// Input: tensor of token IDs [batch, seq]
+    /// Output: embeddings [batch, seq, hidden_size]
+    pub fn embed_special_codec_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
+        match &self.special_codec_embedding {
+            Some(emb) => emb.forward(tokens),
+            None => Err(candle::Error::Msg(
+                "special_codec_embedding not loaded".into(),
+            )),
+        }
+    }
+
+    /// Check if special_codec_embedding is loaded
+    pub fn has_special_codec_embedding(&self) -> bool {
+        self.special_codec_embedding.is_some()
+    }
+
+    /// Generate speech with proper initialization sequence
+    ///
+    /// This method implements the correct Talker initialization as per HuggingFace:
+    /// 1. First 3 positions: text_projection(thinker[:3]) + zeros (no codec embedding)
+    /// 2. Next 3 positions: tts_pad_embed (x3) + codec_embed([speaker, pad, bos])
+    /// 3. Next 1 position: tts_bos_embed + codec_embed for bos
+    /// 4. First text position: text_projection(thinker[3:4]) + ...
+    /// 5. Autoregressive generation for remaining text
+    ///
+    /// # Arguments
+    /// * `thinker_embeds` - Thinker text embeddings [batch, seq, 2048]
+    /// * `tts_special_embeds` - TTS special token embeddings from Thinker (bos, eos, pad) [3, 2048]
+    /// * `speaker` - Speaker enum for voice selection
+    /// * `max_steps` - Maximum generation steps
+    ///
+    /// # Returns
+    /// * Generated codec tokens [batch, total_seq, num_codebooks]
+    pub fn generate_with_speaker(
+        &mut self,
+        thinker_embeds: &Tensor,
+        tts_special_embeds: &Tensor,
+        speaker: Speaker,
+        max_steps: usize,
+    ) -> Result<Tensor> {
+        if self.text_projection.is_none() {
+            return Err(candle::Error::Msg(
+                "text_projection not loaded, cannot use generate_with_speaker".into(),
+            ));
+        }
+        if self.special_codec_embedding.is_none() {
+            return Err(candle::Error::Msg(
+                "special_codec_embedding not loaded, cannot use generate_with_speaker".into(),
+            ));
+        }
+
+        let (batch, text_len, _) = thinker_embeds.dims3()?;
+        if batch != 1 {
+            return Err(candle::Error::Msg(
+                "generate_with_speaker only supports batch_size=1".into(),
+            ));
+        }
+        if text_len < 4 {
+            return Err(candle::Error::Msg(
+                "Need at least 4 text tokens for proper initialization".into(),
+            ));
+        }
+
+        // Clear KV cache for fresh generation
+        self.clear_kv_cache();
+
+        // Helper closure for text projection
+        let text_proj_forward = |proj: &ProjectionMlp, x: &Tensor| -> Result<Tensor> {
+            proj.forward(x)
+        };
+
+        // Project TTS special tokens (tts_bos, tts_eos, tts_pad) through text_projection
+        // tts_special_embeds shape: [3, 2048] -> [1, 3, 2048]
+        let tts_special = tts_special_embeds.unsqueeze(0)?;
+        let tts_special_proj = text_proj_forward(
+            self.text_projection.as_ref().unwrap(),
+            &tts_special
+        )?; // [1, 3, 1024]
+        let tts_bos_embed = tts_special_proj.narrow(1, 0, 1)?; // [1, 1, 1024]
+        let _tts_eos_embed = tts_special_proj.narrow(1, 1, 1)?; // [1, 1, 1024]
+        let tts_pad_embed = tts_special_proj.narrow(1, 2, 1)?; // [1, 1, 1024]
+
+        // Project first 3 thinker tokens (typically: im_start, system tokens)
+        let first_3 = thinker_embeds.narrow(1, 0, 3)?;
+        let first_3_proj = text_proj_forward(
+            self.text_projection.as_ref().unwrap(),
+            &first_3
+        )?; // [1, 3, 1024]
+
+        // Create codec special token sequence: [nothink, think_bos, think_eos, speaker, pad, bos]
+        let codec_special = Tensor::from_slice(
+            &[
+                self.special_tokens.codec_nothink_id,
+                self.special_tokens.codec_think_bos_id,
+                self.special_tokens.codec_think_eos_id,
+                speaker.id(),
+                self.special_tokens.codec_pad_id,
+                self.special_tokens.codec_bos_id,
+            ],
+            (1, 6),
+            &self.device,
+        )?;
+
+        // Embed codec special tokens using special_codec_embedding (vocab_size=3072)
+        let codec_special_embed = self.embed_special_codec_tokens(&codec_special)?; // [1, 6, 1024]
+
+        // Build the initialization sequence (9 positions total):
+        // Text part: [first_3] + [tts_pad x 4] + [tts_bos] + [fourth_token]
+        // Codec part: [zeros(3)] + [codec_embed(6 special tokens)]
+
+        let zeros_3 = Tensor::zeros((1, 3, self.cfg.hidden_size), self.dtype, &self.device)?;
+
+        // Build text part
+        let tts_pad_x4 = tts_pad_embed.repeat(&[1, 4, 1])?; // [1, 4, 1024]
+        let fourth_token = thinker_embeds.narrow(1, 3, 1)?;
+        let fourth_proj = text_proj_forward(
+            self.text_projection.as_ref().unwrap(),
+            &fourth_token
+        )?; // [1, 1, 1024]
+
+        let text_hidden = Tensor::cat(&[
+            &first_3_proj,  // [1, 3, 1024]
+            &tts_pad_x4,    // [1, 4, 1024]
+            &tts_bos_embed, // [1, 1, 1024]
+            &fourth_proj,   // [1, 1, 1024]
+        ], 1)?; // [1, 9, 1024]
+
+        // Build codec part: zeros(3) + codec_embed(6 special tokens)
+        let codec_hidden = Tensor::cat(&[
+            &zeros_3,           // [1, 3, 1024]
+            &codec_special_embed, // [1, 6, 1024]
+        ], 1)?; // [1, 9, 1024]
+
+        // Combine
+        let init_embeds = (text_hidden + codec_hidden)?; // [1, 9, 1024]
+
+        // Process initial sequence through transformer
+        let init_seq_len = 9;
+        let mask = self.causal_mask(1, init_seq_len, 0)?;
+
+        let mut hidden = init_embeds;
+        for layer in &mut self.layers {
+            hidden = layer.forward(&hidden, &self.rotary, Some(&mask), 0)?;
+        }
+        hidden = self.norm.forward(&hidden)?;
+
+        // Generate initial tokens from last position
+        let last_hidden = hidden.narrow(1, init_seq_len - 1, 1)?;
+        let mut current_tokens = self.lm_heads.generate(&last_hidden)?; // [1, 1, 15]
+        let mut all_tokens = vec![current_tokens.clone()];
+
+        // Project remaining text tokens if any
+        let remaining_proj = if text_len > 4 {
+            let remaining = thinker_embeds.narrow(1, 4, text_len - 4)?;
+            Some(text_proj_forward(
+                self.text_projection.as_ref().unwrap(),
+                &remaining
+            )?)
+        } else {
+            None
+        };
+
+        // Process remaining text tokens
+        if let Some(ref remaining) = remaining_proj {
+            let remaining_len = remaining.dim(1)?;
+
+            for pos in 0..remaining_len {
+                let text_embed = remaining.narrow(1, pos, 1)?; // [1, 1, 1024]
+                let codec_embed = self.codec_embedding.forward(&current_tokens)?; // [1, 1, 1024]
+                let combined = (text_embed + codec_embed)?;
+
+                // Get current offset from KV cache
+                let offset = self.layers.first()
+                    .and_then(|l| l.self_attn.kv_cache.as_ref())
+                    .map(|(k, _)| k.dim(2).unwrap_or(0))
+                    .unwrap_or(0);
+
+                // No mask needed for single token with KV cache
+                let mut h = combined;
+                for layer in &mut self.layers {
+                    h = layer.forward(&h, &self.rotary, None, offset)?;
+                }
+                h = self.norm.forward(&h)?;
+
+                current_tokens = self.lm_heads.generate(&h)?;
+                all_tokens.push(current_tokens.clone());
+            }
+        }
+
+        // Autoregressive generation loop
+        for _step in 0..max_steps {
+            // Check for EOS (codec_eos_id in first codebook)
+            let first_cb_token: u32 = current_tokens
+                .narrow(2, 0, 1)?
+                .squeeze(2)?
+                .flatten_all()?
+                .to_vec1()?[0];
+
+            if first_cb_token == self.special_tokens.codec_eos_id {
+                break;
+            }
+
+            // Embed current tokens
+            let codec_embed = self.codec_embedding.forward(&current_tokens)?;
+
+            // Get offset
+            let offset = self.layers.first()
+                .and_then(|l| l.self_attn.kv_cache.as_ref())
+                .map(|(k, _)| k.dim(2).unwrap_or(0))
+                .unwrap_or(0);
+
+            // Forward through layers
+            let mut h = codec_embed;
+            for layer in &mut self.layers {
+                h = layer.forward(&h, &self.rotary, None, offset)?;
+            }
+            h = self.norm.forward(&h)?;
+
+            // Generate next tokens
+            current_tokens = self.lm_heads.generate(&h)?;
+            all_tokens.push(current_tokens.clone());
+        }
+
+        // Concatenate all generated tokens
+        Tensor::cat(&all_tokens, 1)
     }
 
     /// Create causal attention mask

@@ -217,7 +217,7 @@ impl AudioTower {
         let conv1_weight = gg.dequantize(&format!("{prefix}.conv2d1.weight"))?;
         let conv1_bias = gg.dequantize(&format!("{prefix}.conv2d1.bias"))?;
         let conv1_cfg = candle_nn::Conv2dConfig {
-            stride: 1,
+            stride: 2,
             padding: 1,
             ..Default::default()
         };
