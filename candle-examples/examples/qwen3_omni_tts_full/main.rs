@@ -271,6 +271,13 @@ fn main() -> Result<()> {
             flat_tokens.push(token + cb as u32 * code2wav_codebook_size);
         }
     }
+    // DEBUG: Print token statistics
+    println!("\nDEBUG: flat_tokens stats:");
+    let flat_min = flat_tokens.iter().min().unwrap();
+    let flat_max = flat_tokens.iter().max().unwrap();
+    println!("  Count: {}", flat_tokens.len());
+    println!("  Range: [{}, {}]", flat_min, flat_max);
+    println!("  Expected: [0, {}]", code2wav_num_codebooks as u32 * code2wav_codebook_size - 1);
 
     let codec_flat = Tensor::from_slice(&flat_tokens, (batch, seq_len * code2wav_num_codebooks), &device)?;
 
