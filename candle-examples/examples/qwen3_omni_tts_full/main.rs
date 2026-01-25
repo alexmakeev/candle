@@ -127,13 +127,19 @@ fn main() -> Result<()> {
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
-    // Tokenize input
-    println!("\nTokenizing: \"{}\"", args.prompt);
+    // Tokenize input with chat template
+    // Format: <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+    println!("\nTokenizing with chat template: \"{}\"", args.prompt);
+    let chat_text = format!(
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+        args.prompt
+    );
     let encoding = tokenizer
-        .encode(args.prompt.as_str(), false)
+        .encode(chat_text.as_str(), false)
         .map_err(|e| anyhow::anyhow!("Tokenization error: {}", e))?;
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
-    println!("  Tokens: {:?}", token_ids);
+    println!("  Chat text: {}", chat_text.replace('\n', "\\n"));
+    println!("  Tokens: {:?}", &token_ids[..token_ids.len().min(20)]);
     println!("  Count: {}", token_ids.len());
 
     // Select device
@@ -279,9 +285,10 @@ fn main() -> Result<()> {
     println!("  Transposed range: {} - {}", trans_min, trans_max);
 
     // Step 3: Code2Wav synthesis (with offset 1 for Talker codebooks)
+    // Talker outputs codebooks 0-14, Code2Wav expects 1-15
     println!("\nStep 3: Code2Wav audio synthesis...");
     let start = std::time::Instant::now();
-    let audio = code2wav.forward_with_offset(&codec_transposed, 0)?;
+    let audio = code2wav.forward_with_offset(&codec_transposed, 1)?;
     println!(
         "  Audio shape: {:?} ({:.2}s)",
         audio.dims(),
