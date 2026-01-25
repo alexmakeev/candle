@@ -184,6 +184,13 @@ fn main() -> Result<()> {
     if !talker.has_text_projection() {
         anyhow::bail!("Talker missing text_projection - needed for proper TTS initialization");
     }
+    if !talker.has_talker_model() {
+        anyhow::bail!("Talker missing TalkerModel (MoE decoder) - ensure talker.model.* tensors are in GGUF");
+    }
+    if !talker.has_codec_head() {
+        anyhow::bail!("Talker missing codec_head - ensure talker.codec_head.weight is in GGUF");
+    }
+    println!("  TalkerModel layers: {}", talker.talker_model_num_layers());
 
     // Parse speaker
     let speaker = match args.speaker.to_lowercase().as_str() {

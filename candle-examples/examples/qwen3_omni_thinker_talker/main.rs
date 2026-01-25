@@ -90,12 +90,27 @@ fn main() -> Result<()> {
     let mut talker = Talker::from_gguf(&mut gg, &talker_cfg, &device)?;
     println!("Talker loaded successfully!");
 
-    // Check hidden_projection
-    println!("\nHidden projection loaded: {}", talker.has_hidden_projection());
+    // Check all required components
+    println!("\nTalker components:");
+    println!("  Hidden projection: {}", talker.has_hidden_projection());
+    println!("  Text projection: {}", talker.has_text_projection());
+    println!("  TalkerModel (MoE decoder): {}", talker.has_talker_model());
+    println!("  TalkerModel layers: {}", talker.talker_model_num_layers());
+    println!("  codec_head: {}", talker.has_codec_head());
 
     if !talker.has_hidden_projection() {
         println!("ERROR: hidden_projection not found in GGUF file!");
         println!("Cannot test Thinker -> Talker integration.");
+        return Ok(());
+    }
+    if !talker.has_talker_model() {
+        println!("ERROR: TalkerModel not found in GGUF file!");
+        println!("Ensure talker.model.* tensors are present.");
+        return Ok(());
+    }
+    if !talker.has_codec_head() {
+        println!("ERROR: codec_head not found in GGUF file!");
+        println!("Ensure talker.codec_head.weight is present.");
         return Ok(());
     }
 
