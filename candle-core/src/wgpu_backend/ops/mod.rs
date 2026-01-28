@@ -551,6 +551,220 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
+/// BF16 binary operation shader (contiguous inputs only)
+/// Supports: Add(0), Sub(1), Mul(2), Div(3), Min(4), Max(5)
+/// Each thread handles 2 output elements (one packed u32)
+pub const BINARY_BF16_SHADER: &str = r#"
+// BF16 binary op: output = lhs OP rhs
+// All buffers: BF16 packed as u32 (2 BF16 per u32)
+// Contiguous inputs only
+
+@group(0) @binding(0) var<storage, read> lhs: array<u32>;
+@group(0) @binding(1) var<storage, read> rhs: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<u32>;
+
+struct Params {
+    elem_count: u32,
+    op_type: u32,   // 0=Add, 1=Sub, 2=Mul, 3=Div, 4=Min, 5=Max
+    lhs_offset: u32,
+    rhs_offset: u32,
+}
+
+@group(0) @binding(3) var<uniform> params: Params;
+
+fn bf16_to_f32(bits: u32) -> f32 {
+    return bitcast<f32>(bits << 16u);
+}
+
+fn f32_to_bf16(val: f32) -> u32 {
+    return bitcast<u32>(val) >> 16u;
+}
+
+fn read_bf16(buf: ptr<storage, array<u32>, read>, idx: u32) -> f32 {
+    let packed = (*buf)[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+fn apply_op(a: f32, b: f32) -> f32 {
+    switch params.op_type {
+        case 0u: { return a + b; }
+        case 1u: { return a - b; }
+        case 2u: { return a * b; }
+        case 3u: { return a / b; }
+        case 4u: { return min(a, b); }
+        case 5u: { return max(a, b); }
+        default: { return 0.0; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let pair_idx = global_id.x;
+    let elem_idx = pair_idx * 2u;
+
+    if (elem_idx >= params.elem_count) {
+        return;
+    }
+
+    let a0 = read_bf16(&lhs, params.lhs_offset + elem_idx);
+    let b0 = read_bf16(&rhs, params.rhs_offset + elem_idx);
+    let r0 = f32_to_bf16(apply_op(a0, b0));
+
+    var r1: u32 = 0u;
+    if (elem_idx + 1u < params.elem_count) {
+        let a1 = read_bf16(&lhs, params.lhs_offset + elem_idx + 1u);
+        let b1 = read_bf16(&rhs, params.rhs_offset + elem_idx + 1u);
+        r1 = f32_to_bf16(apply_op(a1, b1));
+    }
+
+    output[elem_idx / 2u] = r0 | (r1 << 16u);
+}
+"#;
+
+/// BF16 unary operation shader (contiguous inputs only)
+/// Supports: Exp(0), Log(1), Sin(2), Cos(3), Tanh(4), Neg(5), Recip(6),
+///           Sqr(7), Sqrt(8), Gelu(9), Relu(10), Silu(11), Abs(12),
+///           Ceil(13), Floor(14), Round(15), Sign(16)
+/// Each thread handles 2 output elements (one packed u32)
+pub const UNARY_BF16_SHADER: &str = r#"
+// BF16 unary op: output = OP(input)
+// All buffers: BF16 packed as u32 (2 BF16 per u32)
+// Contiguous inputs only
+
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+
+struct Params {
+    elem_count: u32,
+    op_type: u32,
+    src_offset: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn bf16_to_f32(bits: u32) -> f32 {
+    return bitcast<f32>(bits << 16u);
+}
+
+fn f32_to_bf16(val: f32) -> u32 {
+    return bitcast<u32>(val) >> 16u;
+}
+
+fn read_bf16(idx: u32) -> f32 {
+    let packed = input[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+fn sigmoid(x: f32) -> f32 {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+// Approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+fn gelu_approx(x: f32) -> f32 {
+    let k = 0.7978845608; // sqrt(2/pi)
+    let inner = k * (x + 0.044715 * x * x * x);
+    return 0.5 * x * (1.0 + tanh(inner));
+}
+
+fn apply_op(x: f32) -> f32 {
+    switch params.op_type {
+        case 0u: { return exp(x); }
+        case 1u: { return log(x); }
+        case 2u: { return sin(x); }
+        case 3u: { return cos(x); }
+        case 4u: { return tanh(x); }
+        case 5u: { return -x; }
+        case 6u: { return 1.0 / x; }
+        case 7u: { return x * x; }
+        case 8u: { return sqrt(x); }
+        case 9u: { return gelu_approx(x); }
+        case 10u: { return max(0.0, x); }
+        case 11u: { return x * sigmoid(x); }
+        case 12u: { return abs(x); }
+        case 13u: { return ceil(x); }
+        case 14u: { return floor(x); }
+        case 15u: { return select(x, round(x), true); }  // round
+        case 16u: { return sign(x); }
+        default: { return 0.0; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let pair_idx = global_id.x;
+    let elem_idx = pair_idx * 2u;
+
+    if (elem_idx >= params.elem_count) {
+        return;
+    }
+
+    let r0 = f32_to_bf16(apply_op(read_bf16(params.src_offset + elem_idx)));
+
+    var r1: u32 = 0u;
+    if (elem_idx + 1u < params.elem_count) {
+        r1 = f32_to_bf16(apply_op(read_bf16(params.src_offset + elem_idx + 1u)));
+    }
+
+    output[elem_idx / 2u] = r0 | (r1 << 16u);
+}
+"#;
+
+/// BF16 affine shader: y = x * mul + add (contiguous)
+/// Each thread handles 2 output elements (one packed u32)
+pub const AFFINE_BF16_SHADER: &str = r#"
+// BF16 affine: output = input * mul + add
+
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+
+struct Params {
+    elem_count: u32,
+    src_offset: u32,
+    mul_val: f32,
+    add_val: f32,
+}
+
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn bf16_to_f32(bits: u32) -> f32 {
+    return bitcast<f32>(bits << 16u);
+}
+
+fn f32_to_bf16(val: f32) -> u32 {
+    return bitcast<u32>(val) >> 16u;
+}
+
+fn read_bf16(idx: u32) -> f32 {
+    let packed = input[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let pair_idx = global_id.x;
+    let elem_idx = pair_idx * 2u;
+
+    if (elem_idx >= params.elem_count) {
+        return;
+    }
+
+    let v0 = read_bf16(params.src_offset + elem_idx);
+    let r0 = f32_to_bf16(v0 * params.mul_val + params.add_val);
+
+    var r1: u32 = 0u;
+    if (elem_idx + 1u < params.elem_count) {
+        let v1 = read_bf16(params.src_offset + elem_idx + 1u);
+        r1 = f32_to_bf16(v1 * params.mul_val + params.add_val);
+    }
+
+    output[elem_idx / 2u] = r0 | (r1 << 16u);
+}
+"#;
+
 /// BF16 fused softmax shader
 /// Input: BF16 packed as u32 (2 BF16 per u32, little-endian)
 /// Output: F32 array (will be converted to BF16 on CPU)

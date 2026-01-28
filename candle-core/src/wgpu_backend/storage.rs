@@ -219,6 +219,250 @@ impl WgpuStorage {
         Ok(bf16_output)
     }
 
+    /// BF16 affine on GPU: y = x * mul + add. Input must be contiguous.
+    fn affine_bf16_gpu(&self, layout: &Layout, mul_val: f32, add_val: f32) -> Result<Self> {
+        let elem_count = layout.shape().elem_count();
+        let output_bytes = elem_count * 2;
+
+        let output_buffer = self.device.create_buffer(
+            output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "affine_bf16_output",
+        );
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct AffineParams {
+            elem_count: u32,
+            src_offset: u32,
+            mul_val: f32,
+            add_val: f32,
+        }
+
+        let params = AffineParams {
+            elem_count: elem_count as u32,
+            src_offset: layout.start_offset() as u32,
+            mul_val,
+            add_val,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "affine_bf16_params",
+        );
+
+        let num_pairs = (elem_count + 1) / 2;
+        let workgroups = ((num_pairs as u32) + 255) / 256;
+
+        self.device.with_pipeline(ShaderType::AffineBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("affine_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("affine_bf16_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("affine_bf16_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        Ok(WgpuStorage::new(
+            Arc::new(output_buffer),
+            self.device.clone(),
+            elem_count,
+            DType::BF16,
+        ))
+    }
+
+    /// BF16 unary op on GPU. Input must be contiguous.
+    fn unary_bf16_gpu(&self, layout: &Layout, op_type: u32) -> Result<Self> {
+        let elem_count = layout.shape().elem_count();
+        let output_bytes = elem_count * 2;
+
+        let output_buffer = self.device.create_buffer(
+            output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "unary_bf16_output",
+        );
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct UnaryParams {
+            elem_count: u32,
+            op_type: u32,
+            src_offset: u32,
+            _pad: u32,
+        }
+
+        let params = UnaryParams {
+            elem_count: elem_count as u32,
+            op_type,
+            src_offset: layout.start_offset() as u32,
+            _pad: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "unary_bf16_params",
+        );
+
+        let num_pairs = (elem_count + 1) / 2;
+        let workgroups = ((num_pairs as u32) + 255) / 256;
+
+        self.device.with_pipeline(ShaderType::UnaryBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("unary_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("unary_bf16_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("unary_bf16_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        Ok(WgpuStorage::new(
+            Arc::new(output_buffer),
+            self.device.clone(),
+            elem_count,
+            DType::BF16,
+        ))
+    }
+
+    /// BF16 binary op on GPU. Both inputs must be contiguous.
+    fn binary_bf16_gpu(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout, op_type: u32) -> Result<Self> {
+        let elem_count = lhs_l.shape().elem_count();
+        let output_bytes = elem_count * 2; // BF16 = 2 bytes per element
+
+        let output_buffer = self.device.create_buffer(
+            output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "binary_bf16_output",
+        );
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct BinaryParams {
+            elem_count: u32,
+            op_type: u32,
+            lhs_offset: u32,
+            rhs_offset: u32,
+        }
+
+        let params = BinaryParams {
+            elem_count: elem_count as u32,
+            op_type,
+            lhs_offset: lhs_l.start_offset() as u32,
+            rhs_offset: rhs_l.start_offset() as u32,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "binary_bf16_params",
+        );
+
+        let num_pairs = (elem_count + 1) / 2;
+        let workgroups = ((num_pairs as u32) + 255) / 256;
+
+        self.device.with_pipeline(ShaderType::BinaryBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("binary_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rhs.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("binary_bf16_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("binary_bf16_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        Ok(WgpuStorage::new(
+            Arc::new(output_buffer),
+            self.device.clone(),
+            elem_count,
+            DType::BF16,
+        ))
+    }
+
     /// Cast F32 buffer to BF16 on GPU. No CPU readback.
     /// Returns WgpuStorage with DType::BF16 and `elem_count` elements.
     fn cast_f32_to_bf16_gpu(&self, f32_buffer: &wgpu::Buffer, elem_count: usize) -> Result<Self> {
@@ -483,6 +727,9 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
+        if self.dtype == DType::BF16 && layout.is_contiguous() {
+            return self.affine_bf16_gpu(layout, mul as f32, add as f32);
+        }
         self.from_cpu_op(layout, |cpu, l| cpu.affine(l, mul, add))
     }
 
@@ -524,10 +771,55 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        // GPU path for BF16 contiguous tensors
+        if self.dtype == DType::BF16 && layout.is_contiguous() {
+            let op_type: u32 = match B::NAME {
+                "exp" => 0,
+                "log" => 1,
+                "sin" => 2,
+                "cos" => 3,
+                "tanh" => 4,
+                "neg" => 5,
+                "recip" => 6,
+                "sqr" => 7,
+                "sqrt" => 8,
+                "gelu" => 9,
+                "relu" => 10,
+                "silu" => 11,
+                "abs" => 12,
+                "ceil" => 13,
+                "floor" => 14,
+                "round" => 15,
+                "sign" => 16,
+                _ => {
+                    return self.from_cpu_op(layout, |cpu, l| cpu.unary_impl::<B>(l));
+                }
+            };
+            return self.unary_bf16_gpu(layout, op_type);
+        }
+
         self.from_cpu_op(layout, |cpu, l| cpu.unary_impl::<B>(l))
     }
 
     fn binary_impl<B: BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        // GPU path for BF16 contiguous tensors
+        if self.dtype == DType::BF16 && lhs_l.is_contiguous() && rhs_l.is_contiguous() {
+            let op_type: u32 = match B::NAME {
+                "add" => 0,
+                "sub" => 1,
+                "mul" => 2,
+                "div" => 3,
+                "minimum" => 4,
+                "maximum" => 5,
+                _ => {
+                    return self.from_cpu_binary_op(rhs, lhs_l, rhs_l, |lc, rc, ll, rl| {
+                        lc.binary_impl::<B>(rc, ll, rl)
+                    });
+                }
+            };
+            return self.binary_bf16_gpu(rhs, lhs_l, rhs_l, op_type);
+        }
+
         self.from_cpu_binary_op(rhs, lhs_l, rhs_l, |lhs_cpu, rhs_cpu, ll, rl| {
             lhs_cpu.binary_impl::<B>(rhs_cpu, ll, rl)
         })

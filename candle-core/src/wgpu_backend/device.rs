@@ -41,6 +41,9 @@ pub enum ShaderType {
     CastBF16ToF32,
     CopyStridedBF16,
     CopyStridedF32,
+    BinaryBF16,
+    UnaryBF16,
+    AffineBF16,
 }
 
 /// Unique identifier for a wgpu device
@@ -217,6 +220,9 @@ impl WgpuDevice {
             ShaderType::CastBF16ToF32 => (ops::CAST_BF16_TO_F32_SHADER, "cast_bf16_to_f32"),
             ShaderType::CopyStridedBF16 => (ops::COPY_STRIDED_BF16_SHADER, "copy_strided_bf16"),
             ShaderType::CopyStridedF32 => (ops::COPY_STRIDED_F32_SHADER, "copy_strided_f32"),
+            ShaderType::BinaryBF16 => (ops::BINARY_BF16_SHADER, "binary_bf16"),
+            ShaderType::UnaryBF16 => (ops::UNARY_BF16_SHADER, "unary_bf16"),
+            ShaderType::AffineBF16 => (ops::AFFINE_BF16_SHADER, "affine_bf16"),
         };
 
         let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -366,6 +372,27 @@ impl WgpuDevice {
                         storage_entry(0, true),
                         storage_entry(1, false),
                         uniform_entry(2),
+                    ],
+                })
+            }
+            ShaderType::BinaryBF16 => {
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        storage_entry(0, true),  // lhs
+                        storage_entry(1, true),  // rhs
+                        storage_entry(2, false), // output
+                        uniform_entry(3),        // params
+                    ],
+                })
+            }
+            ShaderType::UnaryBF16 | ShaderType::AffineBF16 => {
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        storage_entry(0, true),  // input
+                        storage_entry(1, false), // output
+                        uniform_entry(2),        // params
                     ],
                 })
             }
