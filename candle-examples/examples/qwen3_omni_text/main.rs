@@ -236,11 +236,18 @@ fn main() -> Result<()> {
     println!("Loading tokenizer from: {}", tokenizer_path.display());
     let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(E::msg)?;
 
-    // Load config
+    // Load config - extract thinker_config.text_config from full config
     let config_path = std::path::Path::new(&args.weight_path).join("config.json");
     println!("Loading config from: {}", config_path.display());
     let config_json = std::fs::read(&config_path)?;
-    let config: ThinkerConfig = serde_json::from_slice(&config_json)?;
+    let full_config: serde_json::Value = serde_json::from_slice(&config_json)?;
+
+    // Extract thinker_config.text_config
+    let thinker_text_config = full_config
+        .get("thinker_config")
+        .and_then(|tc| tc.get("text_config"))
+        .ok_or_else(|| anyhow::anyhow!("Missing thinker_config.text_config in config.json"))?;
+    let config: ThinkerConfig = serde_json::from_value(thinker_text_config.clone())?;
 
     println!("Config: {:?}", config);
     println!("Retrieved files in {:?}", start.elapsed());
