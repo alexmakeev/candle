@@ -1,3 +1,12 @@
+## 2026-01-28 23:45
+Done: Deep research — wgpu backend best practices for ML inference
+- Saved to docs/wgpu_research.md with 80+ sources
+- Key findings: 16x16 tiling for matmul, BF16 via bit-shift (no native WGSL support), VK_KHR_shader_bfloat16 NOT available on RDNA 3.5 (only RDNA 4), WMMA available via ROCm but not through wgpu, 128 KB LDS per WGP, wgpu 4GB buffer limit requires split buffers, UMA zero-copy limited by wgpu MAP_WRITE|STORAGE restriction
+- Burn/CubeCL is most mature wgpu ML framework, TokenHawk has hand-written WGSL transformer shaders
+- llama.cpp WebGPU backend actively developed with WGSL matmul shaders
+
+Next: Apply research to optimize wgpu backend matmul (tiling, shared memory), implement softmax/RMSNorm/RoPE shaders
+
 ## 2026-01-28 21:30
 Done: Integrated wgpu backend into candle-core
 - Moved wgpu_backend module from separate crate to candle-core/src/wgpu_backend/
