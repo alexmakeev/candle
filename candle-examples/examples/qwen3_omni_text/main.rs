@@ -295,7 +295,8 @@ fn main() -> Result<()> {
 
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
     println!("Loading Thinker model...");
-    let model = Thinker::new(&config, vb)?;
+    let vb_thinker = vb.pp("thinker");
+    let model = Thinker::new(&config, vb_thinker)?;
 
     println!("Loaded the model in {:?}", start.elapsed());
 
