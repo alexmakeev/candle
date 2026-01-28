@@ -96,13 +96,27 @@ impl WgpuDevice {
 
         let adapter = Arc::new(adapter);
 
+        // Query adapter limits and request maximum supported buffer size
+        let adapter_limits = adapter.limits();
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_buffer_size = adapter_limits.max_buffer_size;
+        required_limits.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
+
+        eprintln!(
+            "[WGPU] Adapter limits: max_buffer_size={} ({:.0}MB), max_storage_buffer_binding_size={} ({:.0}MB)",
+            adapter_limits.max_buffer_size,
+            adapter_limits.max_buffer_size as f64 / 1048576.0,
+            adapter_limits.max_storage_buffer_binding_size,
+            adapter_limits.max_storage_buffer_binding_size as f64 / 1048576.0,
+        );
+
         let (device, queue) = pollster::block_on(async {
             adapter
                 .request_device(
                     &wgpu::DeviceDescriptor {
                         label: Some("candle-wgpu"),
                         required_features: wgpu::Features::empty(),
-                        required_limits: wgpu::Limits::default(),
+                        required_limits,
                         memory_hints: wgpu::MemoryHints::Performance,
                     },
                     None,
@@ -110,6 +124,14 @@ impl WgpuDevice {
                 .await
         })
         .map_err(|e| crate::Error::Msg(WgpuError::DeviceRequest(e).to_string()))?;
+
+        eprintln!(
+            "[WGPU] Device limits: max_buffer_size={} ({:.0}MB), max_storage_buffer_binding_size={} ({:.0}MB)",
+            device.limits().max_buffer_size,
+            device.limits().max_buffer_size as f64 / 1048576.0,
+            device.limits().max_storage_buffer_binding_size,
+            device.limits().max_storage_buffer_binding_size as f64 / 1048576.0,
+        );
 
         Ok(Self {
             id: DeviceId(ordinal),
