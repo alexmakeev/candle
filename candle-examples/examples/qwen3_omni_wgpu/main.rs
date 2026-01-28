@@ -12,13 +12,11 @@ use candle_examples::token_output_stream::TokenOutputStream;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::qwen3_omni::{Thinker, ThinkerConfig};
-use candle_wgpu::WgpuDevice;
 use tokenizers::Tokenizer;
 
 struct TextGeneration {
     model: Thinker,
     device: Device,
-    wgpu_device: Option<WgpuDevice>,
     tokenizer: TokenOutputStream,
     logits_processor: LogitsProcessor,
     repeat_penalty: f32,
@@ -36,7 +34,6 @@ impl TextGeneration {
         repeat_penalty: f32,
         repeat_last_n: usize,
         device: &Device,
-        wgpu_device: Option<WgpuDevice>,
     ) -> Self {
         let logits_processor = LogitsProcessor::new(seed, temp, top_p);
         Self {
@@ -46,7 +43,6 @@ impl TextGeneration {
             repeat_penalty,
             repeat_last_n,
             device: device.clone(),
-            wgpu_device,
         }
     }
 
@@ -232,30 +228,25 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
 
-    // Initialize WgpuDevice if available
-    let (wgpu_device, wgpu_available) = if !args.cpu && candle_wgpu::is_available() {
-        match WgpuDevice::new(0) {
-            Ok(device) => {
-                let info = device.adapter_info();
-                println!("WgpuDevice initialized successfully!");
-                println!("  Adapter: {}", info.name);
-                println!("  Backend: {:?}", info.backend);
-                println!("  Vendor: {:?}", info.vendor);
-                println!("  Device Type: {:?}", info.device_type);
-                (Some(device), true)
+    // Check wgpu availability via candle-core integrated backend
+    #[cfg(feature = "wgpu")]
+    let wgpu_available = if !args.cpu {
+        if candle::wgpu_backend::is_available() {
+            let adapters = candle::wgpu_backend::list_adapters();
+            println!("wgpu available! Found {} adapter(s):", adapters.len());
+            for (i, info) in adapters.iter().enumerate() {
+                println!("  [{i}] {:?}", info);
             }
-            Err(e) => {
-                println!("Failed to initialize WgpuDevice: {}", e);
-                println!("Falling back to CPU");
-                (None, false)
-            }
+            true
+        } else {
+            println!("Wgpu not available, using CPU");
+            false
         }
     } else {
-        if !args.cpu {
-            println!("Wgpu not available, using CPU");
-        }
-        (None, false)
+        false
     };
+    #[cfg(not(feature = "wgpu"))]
+    let wgpu_available = false;
 
     // Load tokenizer
     let tokenizer_path = match args.tokenizer_file.as_ref() {
@@ -282,25 +273,32 @@ fn main() -> Result<()> {
     println!("Retrieved files in {:?}", start.elapsed());
 
     // Setup device for model loading
-    // Currently, we need to load model on CPU first since VarBuilder doesn't support WgpuDevice
-    let device = if wgpu_available {
-        println!("Note: Model will be loaded on CPU (VarBuilder limitation)");
-        println!("Future versions will support direct GPU loading");
-        Device::Cpu
+    // Now using integrated candle-core wgpu backend for direct GPU loading
+    #[cfg(feature = "wgpu")]
+    let device = if wgpu_available && !args.cpu {
+        println!("Loading model directly on GPU with candle-core wgpu backend");
+        Device::new_wgpu(0)?
     } else {
         candle_examples::device(args.cpu)?
     };
+    #[cfg(not(feature = "wgpu"))]
+    let device = candle_examples::device(args.cpu)?;
 
+    // Use BF16 for GPU devices to save memory
     let dtype = if device.is_cuda() || device.is_metal() {
         DType::BF16
     } else {
-        // For WGPU, we want BF16 but load as F32 first, then convert
-        if wgpu_available {
-            println!("Loading model as F32 (will convert to BF16 for GPU operations)");
-            DType::F32
-        } else {
-            DType::F32
+        #[cfg(feature = "wgpu")]
+        {
+            if device.is_wgpu() {
+                println!("Loading model as BF16 on wgpu (saves ~50% memory)");
+                DType::BF16
+            } else {
+                DType::F32
+            }
         }
+        #[cfg(not(feature = "wgpu"))]
+        DType::F32
     };
     println!("Device: {:?}, dtype: {:?}", device, dtype);
 
@@ -351,9 +349,7 @@ fn main() -> Result<()> {
     println!("Loaded the model in {:?}", start.elapsed());
 
     if wgpu_available {
-        println!("\nWgpu backend is initialized and ready for operations!");
-        println!("Note: Full GPU acceleration will be implemented in future versions.");
-        println!("Currently, inference runs on CPU with WgpuDevice available for testing.\n");
+        println!("\nWgpu backend is initialized and ready for GPU inference!");
     }
 
     let mut pipeline = TextGeneration::new(
@@ -365,7 +361,6 @@ fn main() -> Result<()> {
         args.repeat_penalty,
         args.repeat_last_n,
         &device,
-        wgpu_device,
     );
     pipeline.run(&args.prompt, args.sample_len)?;
     Ok(())
