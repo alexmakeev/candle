@@ -401,11 +401,11 @@ impl DecoderLayer {
 /// Thinker: Main reasoning model
 pub struct Thinker {
     embed_tokens: candle_nn::Embedding,
-    audio_embed: Linear,
+    audio_embed: Option<Linear>,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
-    talker_head: Linear,
+    talker_head: Option<Linear>,
     rotary: Arc<RotaryEmbedding>,
     device: Device,
     dtype: DType,
@@ -417,7 +417,8 @@ impl Thinker {
         let dtype = vb.dtype();
 
         let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
-        let audio_embed = linear_no_bias(cfg.hidden_size, cfg.hidden_size, vb.pp("model.audio_embed"))?;
+        // audio_embed is optional - only present in audio-capable models
+        let audio_embed = linear_no_bias(cfg.hidden_size, cfg.hidden_size, vb.pp("model.audio_embed")).ok();
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_layers = vb.pp("model.layers");
@@ -433,8 +434,8 @@ impl Thinker {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
 
-        // Talker head: project to talker token space
-        let talker_head = linear_no_bias(cfg.hidden_size, 4096, vb.pp("talker_head"))?;
+        // Talker head: project to talker token space (optional)
+        let talker_head = linear_no_bias(cfg.hidden_size, 4096, vb.pp("talker_head")).ok();
 
         let rotary = Arc::new(RotaryEmbedding::new(cfg, &device, dtype)?);
 
@@ -459,7 +460,10 @@ impl Thinker {
     ) -> Result<ThinkerOutput> {
         // Embed audio tokens through audio embedding
         let audio_embeds = self.embed_tokens.forward(audio_tokens)?;
-        let audio_embeds = self.audio_embed.forward(&audio_embeds)?;
+        let audio_embeds = match &self.audio_embed {
+            Some(embed) => embed.forward(&audio_embeds)?,
+            None => audio_embeds,
+        };
 
         // Combine with text prompt if present
         let (embeddings, total_len) = match text_prompt {
@@ -488,8 +492,10 @@ impl Thinker {
 
         // Generate outputs
         let text_logits = self.lm_head.forward(&hidden)?;
-        let talker_logits = self.talker_head.forward(&hidden)?;
-        let talker_tokens = talker_logits.argmax(D::Minus1)?;
+        let talker_tokens = match &self.talker_head {
+            Some(head) => head.forward(&hidden)?.argmax(D::Minus1)?,
+            None => Tensor::zeros((hidden.dim(0)?, hidden.dim(1)?), DType::U32, hidden.device())?,
+        };
 
         Ok(ThinkerOutput {
             text_logits,
@@ -514,8 +520,10 @@ impl Thinker {
         hidden = self.norm.forward(&hidden)?;
 
         let text_logits = self.lm_head.forward(&hidden)?;
-        let talker_logits = self.talker_head.forward(&hidden)?;
-        let talker_tokens = talker_logits.argmax(D::Minus1)?;
+        let talker_tokens = match &self.talker_head {
+            Some(head) => head.forward(&hidden)?.argmax(D::Minus1)?,
+            None => Tensor::zeros((batch, seq_len), DType::U32, hidden.device())?,
+        };
 
         Ok(ThinkerOutput {
             text_logits,
