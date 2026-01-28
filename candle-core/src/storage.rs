@@ -290,6 +290,10 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2)?;
                 Ok((Self::Metal(s), shape))
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(_), Self::Wgpu(_)) => {
+                Err(Error::Msg(format!("CustomOp2 '{}' not supported on wgpu", c.name())))
+            }
             _ => unreachable!(),
         }
     }
@@ -318,6 +322,10 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2, s3, l3)?;
                 Ok((Self::Metal(s), shape))
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(_), Self::Wgpu(_), Self::Wgpu(_)) => {
+                Err(Error::Msg(format!("CustomOp3 '{}' not supported on wgpu", c.name())))
+            }
             _ => unreachable!(),
         }
     }
@@ -344,6 +352,10 @@ impl Storage {
             (Self::Cpu(s1), Self::Cpu(s2)) => c.cpu_fwd(s1, l1, s2, l2),
             (Self::Cuda(s1), Self::Cuda(s2)) => c.cuda_fwd(s1, l1, s2, l2),
             (Self::Metal(s1), Self::Metal(s2)) => c.metal_fwd(s1, l1, s2, l2),
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(_), Self::Wgpu(_)) => {
+                Err(Error::Msg(format!("InplaceOp2 '{}' not supported on wgpu", c.name())))
+            }
             _ => unreachable!(),
         }
     }
@@ -364,6 +376,10 @@ impl Storage {
             (Self::Cuda(s1), Self::Cuda(s2), Self::Cuda(s3)) => c.cuda_fwd(s1, l1, s2, l2, s3, l3),
             (Self::Metal(s1), Self::Metal(s2), Self::Metal(s3)) => {
                 c.metal_fwd(s1, l1, s2, l2, s3, l3)
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(_), Self::Wgpu(_), Self::Wgpu(_)) => {
+                Err(Error::Msg(format!("InplaceOp3 '{}' not supported on wgpu", c.name())))
             }
             _ => unreachable!(),
         }

@@ -534,6 +534,11 @@ pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if !sin.is_contiguous() {
         candle::bail!("sin has to be contiguous in rope")
     }
+    // wgpu does not have a custom RotaryEmb kernel — use the generic tensor-op path
+    #[cfg(feature = "wgpu")]
+    if xs.device().is_wgpu() {
+        return rope_slow(xs, cos, sin);
+    }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmb)
 }
 

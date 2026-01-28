@@ -642,6 +642,11 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             alpha.shape()
         )
     }
+    // wgpu does not have a custom RmsNorm kernel — use the generic tensor-op path
+    #[cfg(feature = "wgpu")]
+    if xs.device().is_wgpu() {
+        return rms_norm_slow(xs, alpha, eps);
+    }
     xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
 }
 
