@@ -595,7 +595,21 @@ impl BackendStorage for WgpuStorage {
             return self.matmul_gpu(rhs, m, n, k);
         }
 
-        // Fall back to CPU
+        // Fall back to CPU (BF16 requires F32 conversion since CPU doesn't support BF16 matmul)
+        if self.dtype == DType::BF16 {
+            let lhs_cpu = self.to_cpu_storage()?;
+            let rhs_cpu = rhs.to_cpu_storage()?;
+            // to_dtype produces contiguous output regardless of input layout
+            let lhs_f32 = lhs_cpu.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs_cpu.to_dtype(rhs_l, DType::F32)?;
+            let lhs_f32_layout = Layout::contiguous(lhs_l.shape());
+            let rhs_f32_layout = Layout::contiguous(rhs_l.shape());
+            let result_f32 = lhs_f32.matmul(&rhs_f32, bmnk, &lhs_f32_layout, &rhs_f32_layout)?;
+            let out_shape = crate::Shape::from_dims(&[b * m, n]);
+            let result_layout = Layout::contiguous(&out_shape);
+            let result_bf16 = result_f32.to_dtype(&result_layout, DType::BF16)?;
+            return BackendDevice::storage_from_cpu_storage(&self.device, &result_bf16);
+        }
         self.from_cpu_binary_op(rhs, lhs_l, rhs_l, |lhs_cpu, rhs_cpu, ll, rl| {
             lhs_cpu.matmul(rhs_cpu, bmnk, ll, rl)
         })
