@@ -1,3 +1,38 @@
+## 2026-01-29 01:30
+Done: Тестирование inference на Qwen3-0.6B (1.5GB, маленькая модель для быстрой отладки)
+- Модель загружается за 245ms на wgpu
+- Добавлен qwen3_wgpu пример для Qwen3ForCausalLM
+- Пропагация wgpu feature в candle-nn
+- Добавлены Wgpu ветки в storage.rs для всех CustomOp1/2/3
+- rms_norm: добавлен slow fallback через базовые тензорные ops
+- rope: добавлен slow fallback через rope_slow
+- BF16 matmul: расширен для batched (loop по batch dim с buffer offsets)
+- Ошибка alignment: min_storage_buffer_offset_alignment=256, batch stride может быть 32
+
+Decision: НИКАКИХ CPU fallback'ов! Всё на шейдерах.
+- Убрать автоматические CPU roundtrip'ы в CustomOp1/2/3
+- Каждая операция должна иметь нативный WGSL шейдер
+- CPU режим — только по явному флагу, не автоматически
+- Цель: 100% GPU inference через шейдеры
+- NPU рассмотрим после GPU версии
+
+Current fix: переделываю batched BF16 matmul — batch dimension через global_id.z в шейдере (не buffer offsets)
+
+Ошибки пройденные в этой сессии:
+1. ✅ wgpu buffer 256MB limit → adapter limits
+2. ✅ OOM при загрузке → streaming mmap + madvise
+3. ✅ GTT exhaustion → rotary first + scoped VarBuilder
+4. ✅ device mismatch copy2d → Wgpu dispatch arms
+5. ✅ rms_norm CustomOp2 → slow path (базовые tensor ops)
+6. ✅ BF16 CPU matmul unsupported → F32 fallback (ВРЕМЕННО, будет заменён на шейдер)
+7. 🔄 batched matmul alignment → batch dim в шейдере (в работе)
+
+Next:
+- Batched BF16 matmul shader с global_id.z
+- Нативные WGSL шейдеры для: rms_norm_bf16, softmax_bf16, rope_bf16
+- Убрать все CPU fallback'и
+- Довести inference до генерации текста
+
 ## 2026-01-29 00:20
 Done: Fixed wgpu buffer size limit, model loading progress
 - Fixed `wgpu::Limits::default()` (256MB max) → request adapter limits (2GB max on RADV)

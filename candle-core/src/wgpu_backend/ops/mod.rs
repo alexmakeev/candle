@@ -474,14 +474,21 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// Input: 2x BF16 packed per u32 (little-endian), row-major
 /// Output: F32 array (will be converted to BF16 on CPU for flexibility)
 pub const MATMUL_BF16_SHADER: &str = r#"
-// BF16 Matrix Multiplication
-// Input: 2x BF16 packed per u32, little-endian, row-major
+// Batched BF16 Matrix Multiplication
+// A[b, M, K] @ B[b, K, N] -> C[b, M, N]
+// Input: BF16 packed as u32 (2 BF16 per u32, little-endian, row-major)
 // Output: F32 array
+// Batch dimension via global_id.z
 
 struct Dimensions {
     M: u32,
     N: u32,
     K: u32,
+    batch_count: u32,
+    a_batch_stride: u32,  // elements per batch in A (M*K)
+    b_batch_stride: u32,  // elements per batch in B (K*N)
+    c_batch_stride: u32,  // elements per batch in C (M*N)
+    _padding: u32,
 }
 
 @group(0) @binding(0) var<storage, read> a: array<u32>;
@@ -499,17 +506,22 @@ fn bf16_to_f32(bits: u32) -> f32 {
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let row = global_id.x;
     let col = global_id.y;
+    let batch = global_id.z;
 
-    if (row >= dims.M || col >= dims.N) {
+    if (row >= dims.M || col >= dims.N || batch >= dims.batch_count) {
         return;
     }
 
+    let a_offset = batch * dims.a_batch_stride;
+    let b_offset = batch * dims.b_batch_stride;
+    let c_offset = batch * dims.c_batch_stride;
+
     var sum: f32 = 0.0;
 
-    // Compute dot product for C[row, col]
+    // Compute dot product for C[batch, row, col]
     for (var kk: u32 = 0u; kk < dims.K; kk = kk + 1u) {
-        // Read A[row, kk]
-        let a_idx = row * dims.K + kk;
+        // Read A[batch, row, kk]
+        let a_idx = a_offset + row * dims.K + kk;
         let a_packed_idx = a_idx / 2u;
         let a_is_high = (a_idx % 2u) == 1u;
         let a_packed = a[a_packed_idx];
@@ -519,8 +531,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             a_is_high
         );
 
-        // Read B[kk, col]
-        let b_idx = kk * dims.N + col;
+        // Read B[batch, kk, col]
+        let b_idx = b_offset + kk * dims.N + col;
         let b_packed_idx = b_idx / 2u;
         let b_is_high = (b_idx % 2u) == 1u;
         let b_packed = b[b_packed_idx];
@@ -534,7 +546,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // Write F32 output
-    let c_idx = row * dims.N + col;
+    let c_idx = c_offset + row * dims.N + col;
     c[c_idx] = sum;
 }
 "#;

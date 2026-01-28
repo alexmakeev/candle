@@ -9,13 +9,27 @@ use crate::{CpuStorage, DType, Layout, Result};
 use std::sync::Arc;
 use wgpu::Buffer;
 
-/// Dimensions struct for matmul shader (must match WGSL struct layout)
+/// Dimensions for F32 matmul shader (must match WGSL struct: M, N, K)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MatmulDimensions {
     m: u32,
     n: u32,
     k: u32,
+    _padding: u32,
+}
+
+/// Dimensions for batched BF16 matmul shader (must match WGSL struct)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MatmulBF16Dimensions {
+    m: u32,
+    n: u32,
+    k: u32,
+    batch_count: u32,
+    a_batch_stride: u32,
+    b_batch_stride: u32,
+    c_batch_stride: u32,
     _padding: u32,
 }
 
@@ -111,28 +125,26 @@ impl WgpuStorage {
     }
 
     /// BF16 matmul on GPU. Supports batched (b >= 1) and contiguous inputs.
-    /// lhs: [b, m, k] in BF16, rhs: [b, k, n] in BF16 → output: [b, m, n] in BF16.
-    /// Internally accumulates in F32, then converts output back to BF16.
+    /// A[b, m, k] @ B[b, k, n] → C[b, m, n] in BF16.
+    /// Internally accumulates in F32, batch dimension dispatched via global_id.z.
     fn matmul_bf16_gpu(&self, rhs: &Self, b: usize, m: usize, n: usize, k: usize) -> Result<Self> {
-        let batch_output_size = m * n;
-        let total_output_size = b * batch_output_size;
-        let batch_output_f32_bytes = batch_output_size * std::mem::size_of::<f32>();
+        let total_output_size = b * m * n;
         let total_output_f32_bytes = total_output_size * std::mem::size_of::<f32>();
 
-        let lhs_batch_bytes = (m * k * 2) as u64; // BF16 = 2 bytes
-        let rhs_batch_bytes = (k * n * 2) as u64;
-
-        // Single F32 output buffer for all batches
         let output_f32_buffer = self.device.create_buffer(
             total_output_f32_bytes as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             "matmul_bf16_output_f32",
         );
 
-        let dims = MatmulDimensions {
+        let dims = MatmulBF16Dimensions {
             m: m as u32,
             n: n as u32,
             k: k as u32,
+            batch_count: b as u32,
+            a_batch_stride: (m * k) as u32,
+            b_batch_stride: (k * n) as u32,
+            c_batch_stride: (m * n) as u32,
             _padding: 0,
         };
         let dims_bytes = bytemuck::bytes_of(&dims);
@@ -144,61 +156,44 @@ impl WgpuStorage {
 
         let workgroups_x = (m as u32 + 15) / 16;
         let workgroups_y = (n as u32 + 15) / 16;
+        let workgroups_z = b as u32;
 
         self.device.with_pipeline(ShaderType::MatmulBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("matmul_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rhs.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_f32_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: dims_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
             let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("matmul_bf16_encoder"),
             });
 
-            for b_idx in 0..b {
-                let lhs_offset = b_idx as u64 * lhs_batch_bytes;
-                let rhs_offset = b_idx as u64 * rhs_batch_bytes;
-                let out_offset = b_idx as u64 * batch_output_f32_bytes as u64;
-
-                let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("matmul_bf16_bind_group"),
-                    layout: &cached.bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &self.buffer,
-                                offset: lhs_offset,
-                                size: std::num::NonZeroU64::new(lhs_batch_bytes),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &rhs.buffer,
-                                offset: rhs_offset,
-                                size: std::num::NonZeroU64::new(rhs_batch_bytes),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &output_f32_buffer,
-                                offset: out_offset,
-                                size: std::num::NonZeroU64::new(batch_output_f32_bytes as u64),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: dims_buffer.as_entire_binding(),
-                        },
-                    ],
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("matmul_bf16_pass"),
+                    timestamp_writes: None,
                 });
-
-                {
-                    let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("matmul_bf16_pass"),
-                        timestamp_writes: None,
-                    });
-                    compute_pass.set_pipeline(&cached.pipeline);
-                    compute_pass.set_bind_group(0, &bind_group, &[]);
-                    compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
-                }
+                compute_pass.set_pipeline(&cached.pipeline);
+                compute_pass.set_bind_group(0, &bind_group, &[]);
+                compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, workgroups_z);
             }
 
             self.device.queue().submit(std::iter::once(encoder.finish()));
