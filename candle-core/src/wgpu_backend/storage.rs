@@ -19,6 +19,20 @@ struct MatmulDimensions {
     _padding: u32,
 }
 
+/// Parameters for strided copy shader (must match WGSL struct, up to 6 dims)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CopyStridedParams {
+    ndims: u32,
+    src_offset: u32,
+    dst_offset: u32,
+    elem_count: u32,
+    // Shape (up to 6 dims, unused dims = 1)
+    shape: [u32; 6],
+    // Source strides (up to 6 dims, unused = 0)
+    strides: [u32; 6],
+}
+
 /// Dimensions for batched BF16 matmul shader (must match WGSL struct)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -199,52 +213,155 @@ impl WgpuStorage {
             self.device.queue().submit(std::iter::once(encoder.finish()));
         });
 
-        // Read back F32 results and convert to BF16
-        let staging_buffer = self.device.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("matmul_bf16_staging"),
-            size: total_output_f32_bytes as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Convert F32 output to BF16 on GPU (no CPU readback)
+        let bf16_output = self.cast_f32_to_bf16_gpu(&output_f32_buffer, total_output_size)?;
 
-        let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("matmul_bf16_readback"),
-        });
-        encoder.copy_buffer_to_buffer(&output_f32_buffer, 0, &staging_buffer, 0, total_output_f32_bytes as u64);
-        self.device.queue().submit(std::iter::once(encoder.finish()));
+        Ok(bf16_output)
+    }
 
-        let buffer_slice = staging_buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
-        });
-        self.device.device().poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .map_err(|_| crate::Error::Msg("BF16 matmul: channel recv error".to_string()))?
-            .map_err(|_| crate::Error::Msg("BF16 matmul: buffer map error".to_string()))?;
-
-        let data = buffer_slice.get_mapped_range();
-        let f32_data: &[f32] = bytemuck::cast_slice(&data);
-
-        // Convert F32 -> BF16 and create output buffer
-        let bf16_data: Vec<half::bf16> = f32_data.iter().map(|&x| half::bf16::from_f32(x)).collect();
-        drop(data);
-        staging_buffer.unmap();
-
-        let bf16_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(bf16_data.as_ptr() as *const u8, bf16_data.len() * 2)
-        };
-        let output_buffer = self.device.create_buffer_init(
-            bf16_bytes,
+    /// Cast F32 buffer to BF16 on GPU. No CPU readback.
+    /// Returns WgpuStorage with DType::BF16 and `elem_count` elements.
+    fn cast_f32_to_bf16_gpu(&self, f32_buffer: &wgpu::Buffer, elem_count: usize) -> Result<Self> {
+        // BF16 output: ceil(elem_count/2) u32s → elem_count * 2 bytes
+        let bf16_bytes = elem_count * 2;
+        let output_buffer = self.device.create_buffer(
+            bf16_bytes as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            "matmul_bf16_output",
+            "cast_f32_to_bf16_output",
         );
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct CastParams {
+            elem_count: u32,
+        }
+
+        let params = CastParams {
+            elem_count: elem_count as u32,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "cast_f32_to_bf16_params",
+        );
+
+        // Each thread handles 2 elements (one packed u32)
+        let num_pairs = (elem_count + 1) / 2;
+        let workgroups = ((num_pairs as u32) + 255) / 256;
+
+        self.device.with_pipeline(ShaderType::CastF32ToBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cast_f32_to_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: f32_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cast_f32_to_bf16_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cast_f32_to_bf16_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
 
         Ok(WgpuStorage::new(
             Arc::new(output_buffer),
             self.device.clone(),
-            total_output_size,
+            elem_count,
             DType::BF16,
+        ))
+    }
+
+    /// Cast BF16 buffer to F32 on GPU. No CPU readback.
+    fn cast_bf16_to_f32_gpu(&self, bf16_buffer: &wgpu::Buffer, elem_count: usize) -> Result<Self> {
+        let f32_bytes = elem_count * std::mem::size_of::<f32>();
+        let output_buffer = self.device.create_buffer(
+            f32_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "cast_bf16_to_f32_output",
+        );
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct CastParams {
+            elem_count: u32,
+        }
+
+        let params = CastParams {
+            elem_count: elem_count as u32,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "cast_bf16_to_f32_params",
+        );
+
+        let workgroups = ((elem_count as u32) + 255) / 256;
+
+        self.device.with_pipeline(ShaderType::CastBF16ToF32, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cast_bf16_to_f32_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: bf16_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cast_bf16_to_f32_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cast_bf16_to_f32_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        Ok(WgpuStorage::new(
+            Arc::new(output_buffer),
+            self.device.clone(),
+            elem_count,
+            DType::F32,
         ))
     }
 
@@ -388,6 +505,19 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        // GPU-native BF16↔F32 casts (contiguous only)
+        if layout.is_contiguous() {
+            match (self.dtype, dtype) {
+                (DType::BF16, DType::F32) => {
+                    return self.cast_bf16_to_f32_gpu(&self.buffer, self.count);
+                }
+                (DType::F32, DType::BF16) => {
+                    return self.cast_f32_to_bf16_gpu(&self.buffer, self.count);
+                }
+                _ => {}
+            }
+        }
+        // Fallback to CPU for other dtype conversions
         let cpu_storage = self.to_cpu_storage()?;
         let result = cpu_storage.to_dtype(layout, dtype)?;
         BackendDevice::storage_from_cpu_storage(&self.device, &result)
@@ -611,12 +741,116 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
-        let src_cpu = self.to_cpu_storage()?;
-        let mut dst_cpu = dst.to_cpu_storage()?;
-        src_cpu.copy_strided_src(&mut dst_cpu, dst_offset, src_l)?;
+        // If contiguous, use a simple buffer copy
+        if src_l.is_contiguous() {
+            let elem_size = self.dtype.size_in_bytes();
+            let src_byte_offset = (src_l.start_offset() * elem_size) as u64;
+            let dst_byte_offset = (dst_offset * elem_size) as u64;
+            let copy_size = (src_l.shape().elem_count() * elem_size) as u64;
 
-        let new_storage = BackendDevice::storage_from_cpu_storage(&self.device, &dst_cpu)?;
-        *dst = new_storage;
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy_contiguous_encoder"),
+            });
+            encoder.copy_buffer_to_buffer(&self.buffer, src_byte_offset, &dst.buffer, dst_byte_offset, copy_size);
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+            return Ok(());
+        }
+
+        // Non-contiguous: use strided copy shader
+        let elem_count = src_l.shape().elem_count();
+        if elem_count == 0 {
+            return Ok(());
+        }
+
+        let dims = src_l.dims();
+        let strides = src_l.stride();
+        let ndims = dims.len();
+        if ndims > 6 {
+            return Err(crate::Error::Msg(
+                "copy_strided_src: more than 6 dimensions not supported on wgpu".to_string(),
+            ));
+        }
+
+        let mut shape_arr = [1u32; 6];
+        let mut stride_arr = [0u32; 6];
+        for i in 0..ndims {
+            shape_arr[i] = dims[i] as u32;
+            stride_arr[i] = strides[i] as u32;
+        }
+
+        let params = CopyStridedParams {
+            ndims: ndims as u32,
+            src_offset: src_l.start_offset() as u32,
+            dst_offset: dst_offset as u32,
+            elem_count: elem_count as u32,
+            shape: shape_arr,
+            strides: stride_arr,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "copy_strided_params",
+        );
+
+        let shader_type = match self.dtype {
+            DType::BF16 => ShaderType::CopyStridedBF16,
+            DType::F32 => ShaderType::CopyStridedF32,
+            _ => {
+                // Fallback to CPU for unsupported dtypes
+                let src_cpu = self.to_cpu_storage()?;
+                let mut dst_cpu = dst.to_cpu_storage()?;
+                src_cpu.copy_strided_src(&mut dst_cpu, dst_offset, src_l)?;
+                let new_storage = BackendDevice::storage_from_cpu_storage(&self.device, &dst_cpu)?;
+                *dst = new_storage;
+                return Ok(());
+            }
+        };
+
+        let workgroups = match self.dtype {
+            DType::BF16 => {
+                let num_pairs = (elem_count + 1) / 2;
+                ((num_pairs as u32) + 255) / 256
+            }
+            _ => ((elem_count as u32) + 255) / 256,
+        };
+
+        self.device.with_pipeline(shader_type, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("copy_strided_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dst.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy_strided_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("copy_strided_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
         Ok(())
     }
 
@@ -630,12 +864,97 @@ impl BackendStorage for WgpuStorage {
         src_o: usize,
         dst_o: usize,
     ) -> Result<()> {
-        let src_cpu = self.to_cpu_storage()?;
-        let mut dst_cpu = dst.to_cpu_storage()?;
-        src_cpu.copy2d(&mut dst_cpu, d1, d2, src_s, dst_s, src_o, dst_o)?;
+        // copy2d: for d1 rows, copy d2 elements with src stride=src_s, dst stride=dst_s
+        // If strides match d2 (contiguous rows), use a single buffer copy
+        if src_s == d2 && dst_s == d2 {
+            let elem_size = self.dtype.size_in_bytes();
+            let total_elems = d1 * d2;
+            let src_byte_offset = (src_o * elem_size) as u64;
+            let dst_byte_offset = (dst_o * elem_size) as u64;
+            let copy_size = (total_elems * elem_size) as u64;
 
-        let new_storage = BackendDevice::storage_from_cpu_storage(&self.device, &dst_cpu)?;
-        *dst = new_storage;
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy2d_contiguous_encoder"),
+            });
+            encoder.copy_buffer_to_buffer(&self.buffer, src_byte_offset, &dst.buffer, dst_byte_offset, copy_size);
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+            return Ok(());
+        }
+
+        // Non-contiguous: use strided copy shader with 2D shape
+        let params = CopyStridedParams {
+            ndims: 2,
+            src_offset: src_o as u32,
+            dst_offset: dst_o as u32,
+            elem_count: (d1 * d2) as u32,
+            shape: [d1 as u32, d2 as u32, 1, 1, 1, 1],
+            strides: [src_s as u32, 1, 0, 0, 0, 0],
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "copy2d_strided_params",
+        );
+
+        let elem_count = d1 * d2;
+        let shader_type = match self.dtype {
+            DType::BF16 => ShaderType::CopyStridedBF16,
+            DType::F32 => ShaderType::CopyStridedF32,
+            _ => {
+                let src_cpu = self.to_cpu_storage()?;
+                let mut dst_cpu = dst.to_cpu_storage()?;
+                src_cpu.copy2d(&mut dst_cpu, d1, d2, src_s, dst_s, src_o, dst_o)?;
+                let new_storage = BackendDevice::storage_from_cpu_storage(&self.device, &dst_cpu)?;
+                *dst = new_storage;
+                return Ok(());
+            }
+        };
+
+        let workgroups = match self.dtype {
+            DType::BF16 => {
+                let num_pairs = (elem_count + 1) / 2;
+                ((num_pairs as u32) + 255) / 256
+            }
+            _ => ((elem_count as u32) + 255) / 256,
+        };
+
+        self.device.with_pipeline(shader_type, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("copy2d_strided_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dst.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy2d_strided_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("copy2d_strided_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
         Ok(())
     }
 

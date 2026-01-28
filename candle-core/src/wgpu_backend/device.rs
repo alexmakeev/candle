@@ -37,6 +37,10 @@ pub enum ShaderType {
     BroadcastDiv,
     SoftmaxBF16,
     LayerNormBF16,
+    CastF32ToBF16,
+    CastBF16ToF32,
+    CopyStridedBF16,
+    CopyStridedF32,
 }
 
 /// Unique identifier for a wgpu device
@@ -209,6 +213,10 @@ impl WgpuDevice {
             ShaderType::BroadcastDiv => (ops::BROADCAST_DIV_SHADER, "broadcast_div"),
             ShaderType::SoftmaxBF16 => (ops::SOFTMAX_BF16_SHADER, "softmax_bf16"),
             ShaderType::LayerNormBF16 => (ops::LAYER_NORM_BF16_SHADER, "layer_norm_bf16"),
+            ShaderType::CastF32ToBF16 => (ops::CAST_F32_TO_BF16_SHADER, "cast_f32_to_bf16"),
+            ShaderType::CastBF16ToF32 => (ops::CAST_BF16_TO_F32_SHADER, "cast_bf16_to_f32"),
+            ShaderType::CopyStridedBF16 => (ops::COPY_STRIDED_BF16_SHADER, "copy_strided_bf16"),
+            ShaderType::CopyStridedF32 => (ops::COPY_STRIDED_F32_SHADER, "copy_strided_f32"),
         };
 
         let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -348,6 +356,26 @@ impl WgpuDevice {
                         storage_entry(2, true),
                         storage_entry(3, false),
                         uniform_entry(4),
+                    ],
+                })
+            }
+            ShaderType::CopyStridedBF16 | ShaderType::CopyStridedF32 => {
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        storage_entry(0, true),
+                        storage_entry(1, false),
+                        uniform_entry(2),
+                    ],
+                })
+            }
+            ShaderType::CastF32ToBF16 | ShaderType::CastBF16ToF32 => {
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        storage_entry(0, true),
+                        storage_entry(1, false),
+                        uniform_entry(2),
                     ],
                 })
             }
