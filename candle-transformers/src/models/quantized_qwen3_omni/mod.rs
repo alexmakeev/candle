@@ -24,10 +24,10 @@ mod talker;
 mod code2wav;
 
 pub use gguf_loader::Gguf;
-pub use config::{Config, Code2WavConfig, TalkerConfig, TalkerModelConfig, CodePredictorConfig, ThinkerConfig, AudioTowerConfig};
+pub use config::{Config, Code2WavConfig, TalkerConfig, ThinkerConfig, AudioTowerConfig};
 pub use audio_tower::AudioTower;
 pub use thinker::{Thinker, ThinkerOutput};
-pub use talker::{Talker, Speaker, TalkerSpecialTokens};
+pub use talker::Talker;
 pub use code2wav::Code2Wav;
 
 use candle::{Device, Result, Tensor};
