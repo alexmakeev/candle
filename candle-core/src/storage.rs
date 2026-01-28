@@ -185,6 +185,11 @@ impl Storage {
                 let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::Metal(storage))
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
+                let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::Wgpu(storage))
+            }
             (lhs, rhs) => {
                 // Should not happen because of the same device check above but we're defensive
                 // anyway.
@@ -705,6 +710,11 @@ impl Storage {
                 let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
                 Ok(Self::Metal(storage))
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(cond), Self::Wgpu(t), Self::Wgpu(f)) => {
+                let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
+                Ok(Self::Wgpu(storage))
+            }
             (_, lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -903,6 +913,10 @@ impl Storage {
             (Self::Metal(src), Self::Metal(dst)) => {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(src), Self::Wgpu(dst)) => {
+                Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -929,6 +943,10 @@ impl Storage {
                 Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
             }
             (Self::Metal(src), Self::Metal(dst)) => {
+                Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(src), Self::Wgpu(dst)) => {
                 Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
             }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
