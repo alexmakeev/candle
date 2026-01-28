@@ -1,3 +1,17 @@
+## 2026-01-29 00:20
+Done: Fixed wgpu buffer size limit, model loading progress
+- Fixed `wgpu::Limits::default()` (256MB max) → request adapter limits (2GB max on RADV)
+- Embedding layer (594MB) now loads successfully in 568ms
+- Added verbose logging to Thinker::new() — layer-by-layer progress
+- Model loaded 41/48 layers before OOM reboot (~112s)
+- Root cause: double allocation — mmap (62GB system RAM) + GPU buffers (64GB VRAM) = 126GB > available
+- Closed beads 3,4,5 (shaders already implemented)
+- Actual model config: decoder_sparse_step=1 (ALL layers MoE), moe_intermediate_size=768, Thinker ~30B params ~60GB BF16
+
+Decision: User setting BIOS VRAM to 96GB (from 64GB). With 96GB VRAM, model (60GB) fits with 36GB headroom for activations. System RAM becomes 32GB — enough for temporary mmap pages.
+
+Next: After reboot with 96GB VRAM, re-run model loading. If loads OK, proceed to text generation (bead 7).
+
 ## 2026-01-28 23:45
 Done: Deep research — wgpu backend best practices for ML inference
 - Saved to docs/wgpu_research.md with 80+ sources
@@ -39,4 +53,7 @@ Issue: OOM on CPU mode (66GB BF16 → 132GB F32)
 Next: Integrate candle-wgpu or find workaround for BF16 on CPU
 
 ## 2026-01-28 16:42
+--- COMPACTING (auto) ---
+
+## 2026-01-28 18:33
 --- COMPACTING (auto) ---
