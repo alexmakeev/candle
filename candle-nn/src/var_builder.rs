@@ -528,6 +528,36 @@ impl SimpleBackend for candle::safetensors::MmapedSafetensors {
     }
 }
 
+impl SimpleBackend for candle::safetensors::StreamingMmapBackend {
+    fn get(
+        &self,
+        s: Shape,
+        name: &str,
+        _: crate::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        let tensor = self.load_and_release(name, dev)?.to_dtype(dtype)?;
+        if tensor.shape() != &s {
+            Err(candle::Error::UnexpectedShape {
+                msg: format!("shape mismatch for {name}"),
+                expected: s,
+                got: tensor.shape().clone(),
+            }
+            .bt())?
+        }
+        Ok(tensor)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
+        self.load_and_release(name, dev)?.to_dtype(dtype)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.inner().get(name).is_ok()
+    }
+}
+
 impl SimpleBackend for candle::safetensors::BufferedSafetensors {
     fn get(
         &self,
@@ -646,6 +676,22 @@ impl<'a> VarBuilder<'a> {
     ) -> Result<Self> {
         let tensors = candle::safetensors::MmapedSafetensors::multi(paths)?;
         Ok(Self::from_backend(Box::new(tensors), dtype, dev.clone()))
+    }
+
+    /// Initializes a `VarBuilder` that releases mmap pages after each tensor is loaded to GPU.
+    /// This prevents double memory allocation for large models, keeping peak RSS low.
+    ///
+    /// # Safety
+    ///
+    /// The unsafe is inherited from [`memmap2::MmapOptions`].
+    pub unsafe fn from_mmaped_safetensors_streaming<P: AsRef<std::path::Path>>(
+        paths: &[P],
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Self> {
+        let tensors = candle::safetensors::MmapedSafetensors::multi(paths)?;
+        let streaming = candle::safetensors::StreamingMmapBackend::new(tensors);
+        Ok(Self::from_backend(Box::new(streaming), dtype, dev.clone()))
     }
 
     /// Initializes a `VarBuilder` from a binary buffer in the safetensor format.

@@ -361,9 +361,9 @@ fn main() -> Result<()> {
         log!("[WEIGHTS]   [{}] {}", i + 1, f.display());
     }
 
-    log!("[MMAP] Memory-mapping safetensors files...");
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-    log!("[MMAP] VarBuilder created OK, dtype={:?}, device={:?}", dtype, device);
+    log!("[MMAP] Memory-mapping safetensors files (streaming mode — pages released after GPU copy)...");
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors_streaming(&filenames, dtype, &device)? };
+    log!("[MMAP] VarBuilder created OK (streaming), dtype={:?}, device={:?}", dtype, device);
 
     log!("[MODEL] Creating Thinker model from weights...");
     let vb_thinker = vb.pp("thinker");

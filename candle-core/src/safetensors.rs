@@ -541,6 +541,69 @@ impl MmapedSafetensors {
     }
 }
 
+/// Wrapper around MmapedSafetensors that releases mmap pages after each tensor
+/// is loaded to the target device. This prevents double memory allocation when
+/// loading large models to GPU — mmap pages are freed immediately after the data
+/// is copied to GPU buffers, keeping peak RSS low.
+pub struct StreamingMmapBackend {
+    inner: MmapedSafetensors,
+}
+
+impl StreamingMmapBackend {
+    pub fn new(inner: MmapedSafetensors) -> Self {
+        Self { inner }
+    }
+
+    /// Load a tensor to device and immediately release the mmap pages for that tensor's data.
+    pub fn load_and_release(&self, name: &str, dev: &Device) -> Result<Tensor> {
+        let index = match &self.inner.routing {
+            None => 0,
+            Some(routing) => {
+                *routing.get(name).ok_or_else(|| {
+                    Error::CannotFindTensor {
+                        path: name.to_string(),
+                    }
+                    .bt()
+                })?
+            }
+        };
+
+        let yoke = &self.inner.safetensors[index];
+        let view = yoke.get().0.tensor(name)?;
+
+        // Remember data range before loading
+        let data = view.data();
+        let data_ptr = data.as_ptr() as usize;
+        let data_len = data.len();
+
+        // Load tensor to device (copies data to GPU buffer)
+        let tensor = view.load(dev)?;
+
+        // Release mmap pages — tell kernel to drop these from page cache
+        #[cfg(unix)]
+        {
+            let mmap: &memmap2::Mmap = yoke.backing_cart();
+            let mmap_base = mmap.as_ptr() as usize;
+            let offset = data_ptr.saturating_sub(mmap_base);
+            if offset + data_len <= mmap.len() {
+                unsafe {
+                    let _ = mmap.unchecked_advise_range(
+                        memmap2::UncheckedAdvice::DontNeed,
+                        offset,
+                        data_len,
+                    );
+                }
+            }
+        }
+
+        Ok(tensor)
+    }
+
+    pub fn inner(&self) -> &MmapedSafetensors {
+        &self.inner
+    }
+}
+
 pub struct SliceSafetensors<'a> {
     safetensors: SafeTensors<'a>,
 }
