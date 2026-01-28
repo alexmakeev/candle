@@ -361,14 +361,21 @@ fn main() -> Result<()> {
         log!("[WEIGHTS]   [{}] {}", i + 1, f.display());
     }
 
-    log!("[MMAP] Memory-mapping safetensors files (streaming mode — pages released after GPU copy)...");
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors_streaming(&filenames, dtype, &device)? };
-    log!("[MMAP] VarBuilder created OK (streaming), dtype={:?}, device={:?}", dtype, device);
+    // Scope VarBuilder so mmap files are dropped immediately after model loading.
+    // This releases all mmap virtual mappings, freeing system RAM for GPU command submission.
+    let model = {
+        log!("[MMAP] Memory-mapping safetensors files (streaming mode — pages released after GPU copy)...");
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors_streaming(&filenames, dtype, &device)? };
+        log!("[MMAP] VarBuilder created OK (streaming), dtype={:?}, device={:?}", dtype, device);
 
-    log!("[MODEL] Creating Thinker model from weights...");
-    let vb_thinker = vb.pp("thinker");
-    log!("[MODEL] VarBuilder prefix set to 'thinker'");
-    let model = Thinker::new(&config, vb_thinker)?;
+        log!("[MODEL] Creating Thinker model from weights...");
+        let vb_thinker = vb.pp("thinker");
+        log!("[MODEL] VarBuilder prefix set to 'thinker'");
+        let model = Thinker::new(&config, vb_thinker)?;
+        log!("[MODEL] Weights loaded, dropping VarBuilder to release mmap...");
+        model
+        // vb dropped here — all mmap file mappings released
+    };
 
     log!("[MODEL] Loaded the model in {:?}", start.elapsed());
 

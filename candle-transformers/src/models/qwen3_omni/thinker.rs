@@ -417,6 +417,12 @@ impl Thinker {
         let dtype = vb.dtype();
         let t0 = std::time::Instant::now();
 
+        // Create rotary embedding FIRST — computed from config, doesn't need VarBuilder.
+        // Must happen before heavy weight loading fills VRAM and exhausts system RAM/GTT.
+        eprintln!("[THINKER] Creating rotary embeddings (computed, no weights)...");
+        let rotary = Arc::new(RotaryEmbedding::new(cfg, &device, dtype)?);
+        eprintln!("[THINKER] Rotary created in {:?}", t0.elapsed());
+
         eprintln!("[THINKER] Loading embed_tokens (vocab={}, hidden={})...", cfg.vocab_size, cfg.hidden_size);
         let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         eprintln!("[THINKER] embed_tokens loaded in {:?}", t0.elapsed());
@@ -450,8 +456,7 @@ impl Thinker {
         let talker_head = linear_no_bias(cfg.hidden_size, 4096, vb.pp("talker_head")).ok();
         eprintln!("[THINKER] talker_head: {}", if talker_head.is_some() { "loaded" } else { "skipped (optional)" });
 
-        let rotary = Arc::new(RotaryEmbedding::new(cfg, &device, dtype)?);
-        eprintln!("[THINKER] Model loaded in {:?}", t0.elapsed());
+        eprintln!("[THINKER] All weights loaded in {:?}", t0.elapsed());
 
         Ok(Self {
             embed_tokens,
