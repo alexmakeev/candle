@@ -415,19 +415,31 @@ impl Thinker {
     pub fn new(cfg: &ThinkerConfig, vb: VarBuilder) -> Result<Self> {
         let device = vb.device().clone();
         let dtype = vb.dtype();
+        let t0 = std::time::Instant::now();
 
+        eprintln!("[THINKER] Loading embed_tokens (vocab={}, hidden={})...", cfg.vocab_size, cfg.hidden_size);
         let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        eprintln!("[THINKER] embed_tokens loaded in {:?}", t0.elapsed());
+
         // audio_embed is optional - only present in audio-capable models
         let audio_embed = linear_no_bias(cfg.hidden_size, cfg.hidden_size, vb.pp("model.audio_embed")).ok();
+        eprintln!("[THINKER] audio_embed: {}", if audio_embed.is_some() { "loaded" } else { "skipped (optional)" });
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_layers = vb.pp("model.layers");
+        eprintln!("[THINKER] Loading {} decoder layers...", cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
+            let lt = std::time::Instant::now();
             layers.push(DecoderLayer::new(i, cfg, vb_layers.pp(i))?);
+            if i % 8 == 0 || i == cfg.num_hidden_layers - 1 {
+                eprintln!("[THINKER] Layer {}/{} loaded in {:?} (total: {:?})", i + 1, cfg.num_hidden_layers, lt.elapsed(), t0.elapsed());
+            }
         }
 
+        eprintln!("[THINKER] Loading norm layer...");
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
 
+        eprintln!("[THINKER] Loading lm_head (tie_embeddings={})...", cfg.tie_word_embeddings);
         let lm_head = if cfg.tie_word_embeddings {
             Linear::from_weights(embed_tokens.embeddings().clone(), None)
         } else {
@@ -436,8 +448,10 @@ impl Thinker {
 
         // Talker head: project to talker token space (optional)
         let talker_head = linear_no_bias(cfg.hidden_size, 4096, vb.pp("talker_head")).ok();
+        eprintln!("[THINKER] talker_head: {}", if talker_head.is_some() { "loaded" } else { "skipped (optional)" });
 
         let rotary = Arc::new(RotaryEmbedding::new(cfg, &device, dtype)?);
+        eprintln!("[THINKER] Model loaded in {:?}", t0.elapsed());
 
         Ok(Self {
             embed_tokens,
