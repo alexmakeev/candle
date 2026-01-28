@@ -71,6 +71,8 @@ pub mod layout;
 pub mod metal_backend;
 #[cfg(feature = "mkl")]
 mod mkl;
+#[cfg(feature = "wgpu")]
+pub mod wgpu_backend;
 pub mod npy;
 pub mod op;
 pub mod pickle;
@@ -121,6 +123,9 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
+
+#[cfg(feature = "wgpu")]
+pub use wgpu_backend::{WgpuDevice, WgpuError, WgpuStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

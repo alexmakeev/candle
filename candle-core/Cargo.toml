@@ -33,6 +33,10 @@ safetensors = { workspace = true }
 thiserror = { workspace = true }
 yoke = { workspace = true }
 zip = { workspace = true }
+wgpu = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
 candle-ug = { workspace = true, optional = true }
@@ -56,6 +60,7 @@ metal = [
     "candle-ug?/metal",
 ]
 ug = ["dep:candle-ug"]
+wgpu = ["dep:wgpu", "dep:bytemuck", "dep:parking_lot", "dep:pollster"]
 
 [[bench]]
 name = "bench_main"
