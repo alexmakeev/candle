@@ -203,6 +203,14 @@ fn main() -> Result<()> {
     use tracing_chrome::ChromeLayerBuilder;
     use tracing_subscriber::prelude::*;
 
+    use std::io::Write;
+    macro_rules! log {
+        ($($arg:tt)*) => {{
+            eprintln!($($arg)*);
+            std::io::stderr().flush().ok();
+        }};
+    }
+
     let args = Args::parse();
     let _guard = if args.tracing {
         let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
@@ -212,15 +220,13 @@ fn main() -> Result<()> {
         None
     };
 
-    println!(
-        "avx: {}, neon: {}, simd128: {}, f16c: {}",
+    log!("[INIT] avx: {}, neon: {}, simd128: {}, f16c: {}",
         candle::utils::with_avx(),
         candle::utils::with_neon(),
         candle::utils::with_simd128(),
         candle::utils::with_f16c()
     );
-    println!(
-        "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
+    log!("[INIT] temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
         args.temperature.unwrap_or(0.),
         args.repeat_penalty,
         args.repeat_last_n
@@ -229,36 +235,44 @@ fn main() -> Result<()> {
     let start = std::time::Instant::now();
 
     // Check wgpu availability via candle-core integrated backend
+    log!("[WGPU] Checking wgpu availability...");
     #[cfg(feature = "wgpu")]
     let wgpu_available = if !args.cpu {
+        log!("[WGPU] Calling is_available()...");
         if candle::wgpu_backend::is_available() {
+            log!("[WGPU] Available! Listing adapters...");
             let adapters = candle::wgpu_backend::list_adapters();
-            println!("wgpu available! Found {} adapter(s):", adapters.len());
+            log!("[WGPU] Found {} adapter(s):", adapters.len());
             for (i, info) in adapters.iter().enumerate() {
-                println!("  [{i}] {:?}", info);
+                log!("[WGPU]   [{i}] {:?}", info);
             }
             true
         } else {
-            println!("Wgpu not available, using CPU");
+            log!("[WGPU] Not available, falling back to CPU");
             false
         }
     } else {
+        log!("[WGPU] CPU mode requested");
         false
     };
     #[cfg(not(feature = "wgpu"))]
-    let wgpu_available = false;
+    let wgpu_available = {
+        log!("[WGPU] wgpu feature not compiled");
+        false
+    };
 
     // Load tokenizer
     let tokenizer_path = match args.tokenizer_file.as_ref() {
         Some(file) => std::path::PathBuf::from(file),
         None => std::path::Path::new(&args.weight_path).join("tokenizer.json"),
     };
-    println!("Loading tokenizer from: {}", tokenizer_path.display());
+    log!("[LOAD] Loading tokenizer from: {}", tokenizer_path.display());
     let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(E::msg)?;
+    log!("[LOAD] Tokenizer loaded OK");
 
     // Load config - extract thinker_config.text_config from full config
     let config_path = std::path::Path::new(&args.weight_path).join("config.json");
-    println!("Loading config from: {}", config_path.display());
+    log!("[LOAD] Loading config from: {}", config_path.display());
     let config_json = std::fs::read(&config_path)?;
     let full_config: serde_json::Value = serde_json::from_slice(&config_json)?;
 
@@ -269,15 +283,19 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Missing thinker_config.text_config in config.json"))?;
     let config: ThinkerConfig = serde_json::from_value(thinker_text_config.clone())?;
 
-    println!("Config: {:?}", config);
-    println!("Retrieved files in {:?}", start.elapsed());
+    log!("[LOAD] Config: hidden_size={}, layers={}, heads={}, experts={}, vocab={}",
+        config.hidden_size, config.num_hidden_layers, config.num_attention_heads,
+        config.num_experts, config.vocab_size);
+    log!("[LOAD] Setup took {:?}", start.elapsed());
 
     // Setup device for model loading
-    // Now using integrated candle-core wgpu backend for direct GPU loading
+    log!("[DEVICE] Setting up device...");
     #[cfg(feature = "wgpu")]
     let device = if wgpu_available && !args.cpu {
-        println!("Loading model directly on GPU with candle-core wgpu backend");
-        Device::new_wgpu(0)?
+        log!("[DEVICE] Creating Device::new_wgpu(0)...");
+        let d = Device::new_wgpu(0)?;
+        log!("[DEVICE] WgpuDevice created successfully");
+        d
     } else {
         candle_examples::device(args.cpu)?
     };
@@ -291,7 +309,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "wgpu")]
         {
             if device.is_wgpu() {
-                println!("Loading model as BF16 on wgpu (saves ~50% memory)");
+                log!("[DEVICE] Using BF16 on wgpu (saves ~50% memory vs F32)");
                 DType::BF16
             } else {
                 DType::F32
@@ -300,21 +318,22 @@ fn main() -> Result<()> {
         #[cfg(not(feature = "wgpu"))]
         DType::F32
     };
-    println!("Device: {:?}, dtype: {:?}", device, dtype);
+    log!("[DEVICE] Device: {:?}, dtype: {:?}", device, dtype);
 
     // Load model weights
     let start = std::time::Instant::now();
     let weight_path = std::path::Path::new(&args.weight_path);
 
     // Check for model.safetensors.index.json or individual files
+    log!("[WEIGHTS] Resolving safetensors files...");
     let filenames = if weight_path.join("model.safetensors.index.json").exists() {
-        println!("Loading sharded model from index file");
+        log!("[WEIGHTS] Found sharded model index file");
         candle_examples::hub_load_local_safetensors(
             args.weight_path.clone(),
             "model.safetensors.index.json",
         )?
     } else if weight_path.join("model.safetensors").exists() {
-        println!("Loading single model file");
+        log!("[WEIGHTS] Found single model file");
         vec![weight_path.join("model.safetensors")]
     } else {
         // Look for model-*.safetensors files
@@ -333,20 +352,25 @@ fn main() -> Result<()> {
             })
             .collect();
         files.sort();
-        println!("Loading {} shard files", files.len());
+        log!("[WEIGHTS] Found {} shard files", files.len());
         files
     };
 
+    log!("[WEIGHTS] {} safetensors files to load:", filenames.len());
     for (i, f) in filenames.iter().enumerate() {
-        println!("  [{}] {}", i + 1, f.display());
+        log!("[WEIGHTS]   [{}] {}", i + 1, f.display());
     }
 
+    log!("[MMAP] Memory-mapping safetensors files...");
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-    println!("Loading Thinker model...");
+    log!("[MMAP] VarBuilder created OK, dtype={:?}, device={:?}", dtype, device);
+
+    log!("[MODEL] Creating Thinker model from weights...");
     let vb_thinker = vb.pp("thinker");
+    log!("[MODEL] VarBuilder prefix set to 'thinker'");
     let model = Thinker::new(&config, vb_thinker)?;
 
-    println!("Loaded the model in {:?}", start.elapsed());
+    log!("[MODEL] Loaded the model in {:?}", start.elapsed());
 
     if wgpu_available {
         println!("\nWgpu backend is initialized and ready for GPU inference!");
