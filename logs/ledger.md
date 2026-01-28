@@ -1,3 +1,60 @@
+## 2026-01-29 04:30
+Done: Zero CPU Fallback — все 5 фаз GPU шейдеров завершены
+- Phase 1: F32↔BF16 cast шейдеры + strided copy (commit fe924328)
+- Phase 2: Binary/Unary/Affine BF16 шейдеры (commit ae5c5e56)
+- Phase 3: Native CustomOp шейдеры — RMS Norm, Softmax, RoPE (commit 86f43ee8)
+  - Добавлен wgpu_fwd в CustomOp1/2/3 traits
+  - RoPE: writes F32 output + cast (избегает u32 packing race condition)
+  - RMS Norm: pair-based output writing (2 BF16 per thread)
+- Phase 4: Reduce (Sum/Max) + Index Select BF16 (commit 11dcb127)
+  - Reduce: composition BF16→F32 cast + F32 reduce shader + F32→BF16 cast
+  - Index Select dim=0: прямое копирование u32-packed строк по индексам
+- Phase 5: Non-contiguous BF16 matmul на GPU (commit bd43a754)
+  - make_contiguous_gpu() + matmul_bf16_gpu вместо CPU fallback
+
+Все операции Qwen3 forward pass теперь GPU-native:
+- 8x matmul (batched BF16, contiguous + non-contiguous)
+- 2x rms_norm (fused workgroup-parallel shader)
+- 1x softmax (fused 3-pass shader)
+- 1x rope (BF16→F32→BF16 composition)
+- ~6x binary ops (Add, Mul, Sub, Div, Min, Max)
+- ~2x unary ops (Silu, Exp, + 15 other ops)
+- ~4x copy_strided_src (contiguous=buffer copy, non-contiguous=shader)
+- 1x index_select dim=0 (embedding lookup)
+- to_dtype BF16↔F32, affine, reduce Sum/Max
+
+CPU fallback остаётся ТОЛЬКО для:
+- Операций, которых нет в Qwen3: conv, pool, upsample, scatter, gather
+- ArgMin/ArgMax (once per token, не на критическом пути)
+- cmp, where_cond, powf, elu (не используются Qwen3)
+
+Сомнение: Shader correctness — shaders написаны, компилируются, но не тестированы на реальном GPU. Нужно push на Lyuda и запустить inference.
+
+Next: Push на Lyuda, тест inference на Radeon 8060S, замерить tok/s
+
+## 2026-01-29 02:10
+Done: ПЕРВЫЙ РАБОЧИЙ INFERENCE на wgpu/Vulkan!
+- Qwen3-0.6B генерирует связный текст: "Hello, I am a student who is taking the AP Calculus AB exam..."
+- 20 токенов, 0.13 tok/s (медленно — есть CPU roundtrip'ы)
+- Batched BF16 matmul через z-dimension шейдера (не buffer offsets)
+- CPU fallback для CustomOp1/2/3 (softmax, rms_norm, rope) — ВРЕМЕННО
+- CPU fallback для non-contiguous BF16 matmul (transposed weights) — ВРЕМЕННО
+
+Architecture decision: НИКАКИХ автоматических CPU fallback'ов в финальной версии.
+- Каждая операция должна иметь нативный WGSL шейдер
+- CPU режим — только по явному флагу --cpu
+- Текущие fallback'и помечены для замены на GPU шейдеры
+- NPU рассмотрим после полной GPU версии
+
+Next priorities (шейдеры):
+1. rms_norm_bf16 — уже есть WGSL шейдер (SoftmaxBF16, LayerNormBF16), проверить
+2. softmax_bf16 — уже есть шейдер (SoftmaxBF16)
+3. rope_bf16 — нужно написать или адаптировать RopeF32
+4. Non-contiguous matmul — strided copy shader или transpose shader
+5. F32→BF16 cast shader (убрать CPU readback из matmul output)
+
+Next: обновить бусины, подключить нативные BF16 шейдеры
+
 ## 2026-01-29 01:30
 Done: Тестирование inference на Qwen3-0.6B (1.5GB, маленькая модель для быстрой отладки)
 - Модель загружается за 245ms на wgpu
@@ -94,4 +151,10 @@ Next: Integrate candle-wgpu or find workaround for BF16 on CPU
 --- COMPACTING (auto) ---
 
 ## 2026-01-28 19:54
+--- COMPACTING (auto) ---
+
+## 2026-01-28 20:32
+--- COMPACTING (auto) ---
+
+## 2026-01-28 21:07
 --- COMPACTING (auto) ---
