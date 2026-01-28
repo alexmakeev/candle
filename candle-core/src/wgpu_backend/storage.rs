@@ -1066,6 +1066,146 @@ impl WgpuStorage {
         ))
     }
 
+    /// Make a non-contiguous tensor contiguous on GPU using strided copy shader.
+    /// Returns a new WgpuStorage with contiguous layout.
+    fn make_contiguous_gpu(&self, layout: &Layout) -> Result<Self> {
+        if layout.is_contiguous() {
+            return Ok(self.clone());
+        }
+        let elem_count = layout.shape().elem_count();
+        let elem_size = self.dtype.size_in_bytes();
+        let output_bytes = elem_count * elem_size;
+
+        let output_buffer = self.device.create_buffer(
+            output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "make_contiguous_output",
+        );
+
+        let mut dst = WgpuStorage::new(
+            Arc::new(output_buffer),
+            self.device.clone(),
+            elem_count,
+            self.dtype,
+        );
+
+        self.copy_strided_src_internal(&mut dst, 0, layout)?;
+
+        Ok(dst)
+    }
+
+    /// Internal version of copy_strided_src for use within WgpuStorage methods.
+    fn copy_strided_src_internal(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
+        // Delegate to the BackendStorage implementation
+        // We re-implement the logic here to avoid borrow issues
+        if src_l.is_contiguous() {
+            let elem_size = self.dtype.size_in_bytes();
+            let src_byte_offset = (src_l.start_offset() * elem_size) as u64;
+            let dst_byte_offset = (dst_offset * elem_size) as u64;
+            let copy_size = (src_l.shape().elem_count() * elem_size) as u64;
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy_contiguous_internal_encoder"),
+            });
+            encoder.copy_buffer_to_buffer(&self.buffer, src_byte_offset, &dst.buffer, dst_byte_offset, copy_size);
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+            return Ok(());
+        }
+
+        let elem_count = src_l.shape().elem_count();
+        if elem_count == 0 {
+            return Ok(());
+        }
+
+        let dims = src_l.dims();
+        let strides = src_l.stride();
+        let ndims = dims.len();
+        if ndims > 6 {
+            return Err(crate::Error::Msg(
+                "copy_strided_src: more than 6 dimensions not supported on wgpu".to_string(),
+            ));
+        }
+
+        let mut shape_arr = [1u32; 6];
+        let mut stride_arr = [0u32; 6];
+        for i in 0..ndims {
+            shape_arr[i] = dims[i] as u32;
+            stride_arr[i] = strides[i] as u32;
+        }
+
+        let params = CopyStridedParams {
+            ndims: ndims as u32,
+            src_offset: src_l.start_offset() as u32,
+            dst_offset: dst_offset as u32,
+            elem_count: elem_count as u32,
+            shape: shape_arr,
+            strides: stride_arr,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "copy_strided_internal_params",
+        );
+
+        let shader_type = match self.dtype {
+            DType::BF16 => ShaderType::CopyStridedBF16,
+            DType::F32 => ShaderType::CopyStridedF32,
+            _ => {
+                return Err(crate::Error::Msg(format!(
+                    "copy_strided_src not implemented on wgpu for dtype {:?}",
+                    self.dtype
+                )));
+            }
+        };
+
+        let workgroups = match self.dtype {
+            DType::BF16 => {
+                let num_pairs = (elem_count + 1) / 2;
+                ((num_pairs as u32) + 255) / 256
+            }
+            _ => ((elem_count as u32) + 255) / 256,
+        };
+
+        self.device.with_pipeline(shader_type, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("copy_strided_internal_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dst.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy_strided_internal_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("copy_strided_internal_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        Ok(())
+    }
+
     fn matmul_gpu(&self, rhs: &Self, m: usize, n: usize, k: usize) -> Result<Self> {
         let output_size = m * n;
         let output_bytes = output_size * std::mem::size_of::<f32>();
@@ -1558,20 +1698,11 @@ impl BackendStorage for WgpuStorage {
             return self.matmul_gpu(rhs, m, n, k);
         }
 
-        // Fall back to CPU (BF16 requires F32 conversion since CPU doesn't support BF16 matmul)
-        if self.dtype == DType::BF16 {
-            let lhs_cpu = self.to_cpu_storage()?;
-            let rhs_cpu = rhs.to_cpu_storage()?;
-            // to_dtype produces contiguous output regardless of input layout
-            let lhs_f32 = lhs_cpu.to_dtype(lhs_l, DType::F32)?;
-            let rhs_f32 = rhs_cpu.to_dtype(rhs_l, DType::F32)?;
-            let lhs_f32_layout = Layout::contiguous(lhs_l.shape());
-            let rhs_f32_layout = Layout::contiguous(rhs_l.shape());
-            let result_f32 = lhs_f32.matmul(&rhs_f32, bmnk, &lhs_f32_layout, &rhs_f32_layout)?;
-            let out_shape = crate::Shape::from_dims(&[b * m, n]);
-            let result_layout = Layout::contiguous(&out_shape);
-            let result_bf16 = result_f32.to_dtype(&result_layout, DType::BF16)?;
-            return BackendDevice::storage_from_cpu_storage(&self.device, &result_bf16);
+        // Non-contiguous BF16: make contiguous on GPU, then matmul
+        if self.dtype == DType::BF16 && !is_contiguous {
+            let lhs_contiguous = self.make_contiguous_gpu(lhs_l)?;
+            let rhs_contiguous = rhs.make_contiguous_gpu(rhs_l)?;
+            return lhs_contiguous.matmul_bf16_gpu(&rhs_contiguous, b, m, n, k);
         }
         self.from_cpu_binary_op(rhs, lhs_l, rhs_l, |lhs_cpu, rhs_cpu, ll, rl| {
             lhs_cpu.matmul(rhs_cpu, bmnk, ll, rl)
