@@ -467,6 +467,78 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
+/// WGSL shader for BF16 matrix multiplication
+/// BF16 stored as u16 (upper 16 bits of f32), converted to f32 for computation
+///
+/// A[M, K] @ B[K, N] = C[M, N]
+/// Input: 2x BF16 packed per u32 (little-endian), row-major
+/// Output: F32 array (will be converted to BF16 on CPU for flexibility)
+pub const MATMUL_BF16_SHADER: &str = r#"
+// BF16 Matrix Multiplication
+// Input: 2x BF16 packed per u32, little-endian, row-major
+// Output: F32 array
+
+struct Dimensions {
+    M: u32,
+    N: u32,
+    K: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a: array<u32>;
+@group(0) @binding(1) var<storage, read> b: array<u32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> dims: Dimensions;
+
+// Convert BF16 (16-bit) to F32
+// BF16 = upper 16 bits of f32, so just shift left 16
+fn bf16_to_f32(bits: u32) -> f32 {
+    return bitcast<f32>(bits << 16u);
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let row = global_id.x;
+    let col = global_id.y;
+
+    if (row >= dims.M || col >= dims.N) {
+        return;
+    }
+
+    var sum: f32 = 0.0;
+
+    // Compute dot product for C[row, col]
+    for (var kk: u32 = 0u; kk < dims.K; kk = kk + 1u) {
+        // Read A[row, kk]
+        let a_idx = row * dims.K + kk;
+        let a_packed_idx = a_idx / 2u;
+        let a_is_high = (a_idx % 2u) == 1u;
+        let a_packed = a[a_packed_idx];
+        let a_val = select(
+            bf16_to_f32(a_packed & 0xFFFFu),
+            bf16_to_f32(a_packed >> 16u),
+            a_is_high
+        );
+
+        // Read B[kk, col]
+        let b_idx = kk * dims.N + col;
+        let b_packed_idx = b_idx / 2u;
+        let b_is_high = (b_idx % 2u) == 1u;
+        let b_packed = b[b_packed_idx];
+        let b_val = select(
+            bf16_to_f32(b_packed & 0xFFFFu),
+            bf16_to_f32(b_packed >> 16u),
+            b_is_high
+        );
+
+        sum = sum + a_val * b_val;
+    }
+
+    // Write F32 output
+    let c_idx = row * dims.N + col;
+    c[c_idx] = sum;
+}
+"#;
+
 /// Fused softmax shader - does everything in one kernel
 /// This is more efficient than separate max/sub/exp/sum/div operations
 pub const SOFTMAX_FUSED_SHADER: &str = r#"

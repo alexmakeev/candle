@@ -23,6 +23,8 @@ pub struct CachedPipeline {
 pub enum ShaderType {
     MatmulF32,
     MatmulF16,
+    /// BF16 matmul (stored as u16, computed as f32)
+    MatmulBF16,
     SoftmaxF32,
     /// Fused softmax (more efficient than separate ops)
     SoftmaxFused,
@@ -186,6 +188,7 @@ impl WgpuDevice {
         let (shader_source, label) = match shader_type {
             ShaderType::MatmulF32 => (ops::MATMUL_SHADER, "matmul_f32"),
             ShaderType::MatmulF16 => (ops::MATMUL_SHADER, "matmul_f16"), // TODO: F16 shader
+            ShaderType::MatmulBF16 => (ops::MATMUL_BF16_SHADER, "matmul_bf16"),
             ShaderType::SoftmaxF32 => (ops::SOFTMAX_SHADER, "softmax_f32"),
             ShaderType::SoftmaxFused => (ops::SOFTMAX_FUSED_SHADER, "softmax_fused"),
             ShaderType::LayerNormF32 => (ops::LAYER_NORM_SHADER, "layer_norm_f32"),
@@ -206,7 +209,7 @@ impl WgpuDevice {
 
         // Create bind group layout based on shader type
         let bind_group_layout = match shader_type {
-            ShaderType::MatmulF32 | ShaderType::MatmulF16 => {
+            ShaderType::MatmulF32 | ShaderType::MatmulF16 | ShaderType::MatmulBF16 => {
                 self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some(&format!("{}_bind_group_layout", label)),
                     entries: &[

@@ -115,6 +115,134 @@ impl WgpuStorage {
         BackendDevice::storage_from_cpu_storage(&self.device, &result)
     }
 
+    /// GPU implementation of BF16 matrix multiplication
+    /// A[M, K] @ B[K, N] = C[M, N]
+    /// BF16 values stored as u16 (upper 16 bits of f32)
+    ///
+    /// Strategy: compute in F32 on GPU, then convert to BF16 on readback
+    fn matmul_bf16_gpu(&self, rhs: &Self, m: usize, n: usize, k: usize) -> Result<Self> {
+        let output_size = m * n;
+        // Output is F32 from shader
+        let output_f32_bytes = output_size * std::mem::size_of::<f32>();
+
+        // Create F32 output buffer
+        let output_f32_buffer = self.device.create_buffer(
+            output_f32_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "matmul_bf16_output_f32",
+        );
+
+        // Create dimensions uniform buffer
+        let dims = MatmulDimensions {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            _padding: 0,
+        };
+        let dims_bytes = bytemuck::bytes_of(&dims);
+        let dims_buffer = self.device.create_buffer_init(
+            dims_bytes,
+            wgpu::BufferUsages::UNIFORM,
+            "matmul_bf16_dims",
+        );
+
+        // Get or compile the BF16 matmul pipeline and dispatch
+        self.device.with_pipeline(ShaderType::MatmulBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("matmul_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rhs.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_f32_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: dims_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("matmul_bf16_encoder"),
+            });
+
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("matmul_bf16_pass"),
+                    timestamp_writes: None,
+                });
+
+                compute_pass.set_pipeline(&cached.pipeline);
+                compute_pass.set_bind_group(0, &bind_group, &[]);
+
+                // Dispatch: workgroup_size(16, 16)
+                let workgroups_x = (m as u32 + 15) / 16;
+                let workgroups_y = (n as u32 + 15) / 16;
+                compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        // Read back F32 results
+        let staging_buffer = self.device.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("matmul_bf16_staging"),
+            size: output_f32_bytes as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("matmul_bf16_readback"),
+        });
+        encoder.copy_buffer_to_buffer(&output_f32_buffer, 0, &staging_buffer, 0, output_f32_bytes as u64);
+        self.device.queue().submit(std::iter::once(encoder.finish()));
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.device().poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|_| candle_core::Error::Msg("BF16 matmul: channel recv error".to_string()))?
+            .map_err(|_| candle_core::Error::Msg("BF16 matmul: buffer map error".to_string()))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let f32_data: &[f32] = bytemuck::cast_slice(&data);
+
+        // Convert F32 -> BF16 and create output buffer
+        let bf16_data: Vec<half::bf16> = f32_data.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        drop(data);
+        staging_buffer.unmap();
+
+        // Create BF16 output buffer
+        let bf16_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(bf16_data.as_ptr() as *const u8, bf16_data.len() * 2)
+        };
+        let output_buffer = self.device.create_buffer_init(
+            bf16_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "matmul_bf16_output",
+        );
+
+        Ok(WgpuStorage::new(
+            Arc::new(output_buffer),
+            self.device.clone(),
+            output_size,
+            DType::BF16,
+        ))
+    }
+
     /// GPU implementation of matrix multiplication
     /// A[M, K] @ B[K, N] = C[M, N]
     fn matmul_gpu(&self, rhs: &Self, m: usize, n: usize, k: usize) -> Result<Self> {
@@ -482,21 +610,24 @@ impl BackendStorage for WgpuStorage {
     ) -> Result<Self> {
         let (b, m, n, k) = bmnk;
 
-        // For now, only support F32 and contiguous layouts on GPU
-        // Fall back to CPU for other cases
-        let use_gpu = self.dtype == DType::F32
-            && lhs_l.is_contiguous()
-            && rhs_l.is_contiguous()
-            && b == 1; // Batched matmul not yet supported on GPU
+        // Check for GPU-supported cases
+        let is_contiguous = lhs_l.is_contiguous() && rhs_l.is_contiguous();
+        let is_unbatched = b == 1;
 
-        if !use_gpu {
-            return self.from_cpu_binary_op(rhs, lhs_l, rhs_l, |lhs_cpu, rhs_cpu, ll, rl| {
-                lhs_cpu.matmul(rhs_cpu, bmnk, ll, rl)
-            });
+        // BF16 GPU matmul
+        if self.dtype == DType::BF16 && is_contiguous && is_unbatched {
+            return self.matmul_bf16_gpu(rhs, m, n, k);
         }
 
-        // GPU matmul implementation
-        self.matmul_gpu(rhs, m, n, k)
+        // F32 GPU matmul
+        if self.dtype == DType::F32 && is_contiguous && is_unbatched {
+            return self.matmul_gpu(rhs, m, n, k);
+        }
+
+        // Fall back to CPU for other cases
+        self.from_cpu_binary_op(rhs, lhs_l, rhs_l, |lhs_cpu, rhs_cpu, ll, rl| {
+            lhs_cpu.matmul(rhs_cpu, bmnk, ll, rl)
+        })
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {

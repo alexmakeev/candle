@@ -203,9 +203,239 @@ mod tests {
                         i, r, e
                     );
                 }
-                println!("✅ matmul test passed!");
+                println!("matmul F32 test passed!");
             }
             _ => panic!("Unexpected dtype in result"),
+        }
+    }
+
+    #[test]
+    fn test_bf16_matmul_simple() {
+        if !is_available() {
+            println!("Skipping test: no wgpu adapter available");
+            return;
+        }
+
+        let device = WgpuDevice::new(0).expect("Failed to create wgpu device");
+        let info = device.adapter_info();
+        println!("Testing BF16 matmul on: {} ({:?})", info.name, info.backend);
+
+        // Create test matrices A[2,3] @ B[3,4] = C[2,4]
+        // Using simple values that convert cleanly to BF16
+        let a_f32: Vec<f32> = vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+        ];
+        let b_f32: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+        ];
+
+        // Convert to BF16 (as u16 bits)
+        let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let b_bf16: Vec<half::bf16> = b_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+
+        // Expected result (same as F32 test):
+        // C[0,0] = 1*1 + 2*5 + 3*9 = 38
+        // C[0,1] = 1*2 + 2*6 + 3*10 = 44
+        // C[0,2] = 1*3 + 2*7 + 3*11 = 50
+        // C[0,3] = 1*4 + 2*8 + 3*12 = 56
+        // C[1,0] = 4*1 + 5*5 + 6*9 = 83
+        // C[1,1] = 4*2 + 5*6 + 6*10 = 98
+        // C[1,2] = 4*3 + 5*7 + 6*11 = 113
+        // C[1,3] = 4*4 + 5*8 + 6*12 = 128
+        let expected: Vec<f32> = vec![
+            38.0, 44.0, 50.0, 56.0,
+            83.0, 98.0, 113.0, 128.0,
+        ];
+
+        // Create BF16 storage
+        // BF16 is stored as raw u16 bytes
+        let a_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                a_bf16.as_ptr() as *const u8,
+                a_bf16.len() * 2,
+            )
+        };
+        let b_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                b_bf16.as_ptr() as *const u8,
+                b_bf16.len() * 2,
+            )
+        };
+
+        let a_buffer = device.create_buffer_init(
+            a_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "bf16_a",
+        );
+        let b_buffer = device.create_buffer_init(
+            b_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "bf16_b",
+        );
+
+        let a_storage = WgpuStorage::new(
+            std::sync::Arc::new(a_buffer),
+            device.clone(),
+            a_bf16.len(),
+            DType::BF16,
+        );
+        let b_storage = WgpuStorage::new(
+            std::sync::Arc::new(b_buffer),
+            device.clone(),
+            b_bf16.len(),
+            DType::BF16,
+        );
+
+        // Create layouts
+        let a_shape = candle_core::Shape::from((2, 3));
+        let b_shape = candle_core::Shape::from((3, 4));
+        let a_layout = candle_core::Layout::contiguous(&a_shape);
+        let b_layout = candle_core::Layout::contiguous(&b_shape);
+
+        // Perform matmul: bmnk = (batch=1, m=2, n=4, k=3)
+        let c_storage = a_storage
+            .matmul(&b_storage, (1, 2, 4, 3), &a_layout, &b_layout)
+            .expect("BF16 matmul failed");
+
+        // Read back result (BF16 -> f32)
+        let c_cpu = c_storage.to_cpu_storage().expect("Failed to transfer result to CPU");
+        match c_cpu {
+            candle_core::CpuStorage::BF16(result_bf16) => {
+                let result: Vec<f32> = result_bf16.iter().map(|x| x.to_f32()).collect();
+                println!("Result: {:?}", result);
+                println!("Expected: {:?}", expected);
+                assert_eq!(result.len(), expected.len(), "Result length mismatch");
+                for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
+                    // BF16 has lower precision, allow 1% error
+                    let rel_error = if e.abs() > 1e-6 { (r - e).abs() / e.abs() } else { (r - e).abs() };
+                    assert!(
+                        rel_error < 0.01,
+                        "Mismatch at index {}: got {}, expected {}, rel_error={}%",
+                        i, r, e, rel_error * 100.0
+                    );
+                }
+                println!("BF16 matmul test passed!");
+            }
+            _ => panic!("Unexpected dtype in result: expected BF16"),
+        }
+    }
+
+    #[test]
+    fn test_bf16_matmul_larger() {
+        if !is_available() {
+            println!("Skipping test: no wgpu adapter available");
+            return;
+        }
+
+        let device = WgpuDevice::new(0).expect("Failed to create wgpu device");
+        println!("Testing larger BF16 matmul on: {}", device.adapter_info().name);
+
+        // 32x64 @ 64x32 = 32x32
+        let m = 32;
+        let k = 64;
+        let n = 32;
+
+        // Create test data with larger values to avoid near-zero relative error issues
+        // Values range roughly from -8 to +8
+        let a_f32: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 - 8.0).collect();
+        let b_f32: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) * 0.5).collect();
+
+        // Convert to BF16 first, then compute expected from BF16 values
+        // This gives us the "fair" expected result accounting for BF16 input quantization
+        let a_bf16: Vec<half::bf16> = a_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let b_bf16: Vec<half::bf16> = b_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+
+        // Compute expected on CPU using BF16 inputs
+        let mut expected = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0f32;
+                for kk in 0..k {
+                    let a_val = a_bf16[row * k + kk].to_f32();
+                    let b_val = b_bf16[kk * n + col].to_f32();
+                    sum += a_val * b_val;
+                }
+                expected[row * n + col] = sum;
+            }
+        }
+
+        let a_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(a_bf16.as_ptr() as *const u8, a_bf16.len() * 2)
+        };
+        let b_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(b_bf16.as_ptr() as *const u8, b_bf16.len() * 2)
+        };
+
+        let a_buffer = device.create_buffer_init(
+            a_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "bf16_a_large",
+        );
+        let b_buffer = device.create_buffer_init(
+            b_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "bf16_b_large",
+        );
+
+        let a_storage = WgpuStorage::new(
+            std::sync::Arc::new(a_buffer),
+            device.clone(),
+            a_bf16.len(),
+            DType::BF16,
+        );
+        let b_storage = WgpuStorage::new(
+            std::sync::Arc::new(b_buffer),
+            device.clone(),
+            b_bf16.len(),
+            DType::BF16,
+        );
+
+        let a_shape = candle_core::Shape::from((m, k));
+        let b_shape = candle_core::Shape::from((k, n));
+        let a_layout = candle_core::Layout::contiguous(&a_shape);
+        let b_layout = candle_core::Layout::contiguous(&b_shape);
+
+        let c_storage = a_storage
+            .matmul(&b_storage, (1, m, n, k), &a_layout, &b_layout)
+            .expect("BF16 matmul failed");
+
+        let c_cpu = c_storage.to_cpu_storage().expect("Failed to transfer");
+        match c_cpu {
+            candle_core::CpuStorage::BF16(result_bf16) => {
+                let result: Vec<f32> = result_bf16.iter().map(|x| x.to_f32()).collect();
+
+                // Check max error
+                let mut max_abs_error = 0.0f32;
+                let mut max_rel_error = 0.0f32;
+                let mut worst_idx = 0;
+                for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
+                    let abs_error = (r - e).abs();
+                    // For relative error, only consider values with reasonable magnitude
+                    let rel_error = if e.abs() > 1.0 { abs_error / e.abs() } else { abs_error / 1.0 };
+                    if abs_error > max_abs_error {
+                        max_abs_error = abs_error;
+                    }
+                    if rel_error > max_rel_error {
+                        max_rel_error = rel_error;
+                        worst_idx = i;
+                    }
+                }
+                println!("Max absolute error: {:.6}", max_abs_error);
+                println!("Max relative error: {:.4}% at index {} (got={}, expected={})",
+                        max_rel_error * 100.0, worst_idx, result[worst_idx], expected[worst_idx]);
+
+                // BF16 has 7 mantissa bits, so ~0.8% precision
+                // With 64 accumulations, error can compound
+                // Allow 2% relative error for large values
+                assert!(max_rel_error < 0.02 || max_abs_error < 1.0,
+                        "Error too large: rel={:.2}%, abs={:.4}",
+                        max_rel_error * 100.0, max_abs_error);
+                println!("Larger BF16 matmul test passed! ({}x{} @ {}x{})", m, k, k, n);
+            }
+            _ => panic!("Unexpected dtype"),
         }
     }
 }
