@@ -263,14 +263,8 @@ impl Storage {
             }
             #[cfg(feature = "wgpu")]
             Self::Wgpu(storage) => {
-                // No custom GPU kernels for wgpu — run on CPU and copy result back
-                let cpu_storage = storage.to_cpu_storage()?;
-                let cpu_layout = Layout::contiguous(l.shape());
-                let (result_cpu, shape) = c.cpu_fwd(&cpu_storage, &cpu_layout)?;
-                let result_gpu = crate::backend::BackendDevice::storage_from_cpu_storage(
-                    storage.device(), &result_cpu,
-                )?;
-                Ok((Self::Wgpu(result_gpu), shape))
+                let (s, shape) = c.wgpu_fwd(storage, l)?;
+                Ok((Self::Wgpu(s), shape))
             }
         }
     }
@@ -298,16 +292,8 @@ impl Storage {
             }
             #[cfg(feature = "wgpu")]
             (Self::Wgpu(s1), Self::Wgpu(s2)) => {
-                // No custom GPU kernels for wgpu — run on CPU and copy result back
-                let cpu1 = s1.to_cpu_storage()?;
-                let cpu2 = s2.to_cpu_storage()?;
-                let cl1 = Layout::contiguous(l1.shape());
-                let cl2 = Layout::contiguous(l2.shape());
-                let (result_cpu, shape) = c.cpu_fwd(&cpu1, &cl1, &cpu2, &cl2)?;
-                let result_gpu = crate::backend::BackendDevice::storage_from_cpu_storage(
-                    s1.device(), &result_cpu,
-                )?;
-                Ok((Self::Wgpu(result_gpu), shape))
+                let (s, shape) = c.wgpu_fwd(s1, l1, s2, l2)?;
+                Ok((Self::Wgpu(s), shape))
             }
             _ => unreachable!(),
         }
@@ -339,18 +325,8 @@ impl Storage {
             }
             #[cfg(feature = "wgpu")]
             (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => {
-                // No custom GPU kernels for wgpu — run on CPU and copy result back
-                let cpu1 = s1.to_cpu_storage()?;
-                let cpu2 = s2.to_cpu_storage()?;
-                let cpu3 = s3.to_cpu_storage()?;
-                let cl1 = Layout::contiguous(l1.shape());
-                let cl2 = Layout::contiguous(l2.shape());
-                let cl3 = Layout::contiguous(l3.shape());
-                let (result_cpu, shape) = c.cpu_fwd(&cpu1, &cl1, &cpu2, &cl2, &cpu3, &cl3)?;
-                let result_gpu = crate::backend::BackendDevice::storage_from_cpu_storage(
-                    s1.device(), &result_cpu,
-                )?;
-                Ok((Self::Wgpu(result_gpu), shape))
+                let (s, shape) = c.wgpu_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::Wgpu(s), shape))
             }
             _ => unreachable!(),
         }

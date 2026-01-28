@@ -1169,6 +1169,216 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
+/// BF16 RMS Normalization shader
+/// Input: BF16 packed as u32, Alpha (weight): BF16 packed as u32
+/// Output: BF16 packed as u32
+/// Computes: y = x * rsqrt(mean(x^2) + eps) * alpha
+/// One workgroup per row (batch element)
+pub const RMS_NORM_BF16_SHADER: &str = r#"
+// BF16 RMS Normalization
+// Input, alpha: BF16 packed as u32 (2 BF16 per u32)
+// Output: BF16 packed as u32
+
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> alpha: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<u32>;
+
+struct Params {
+    num_rows: u32,
+    hidden_size: u32,
+    eps: f32,
+    input_offset: u32,
+}
+
+@group(0) @binding(3) var<uniform> params: Params;
+
+var<workgroup> shared_data: array<f32, 256>;
+
+fn bf16_to_f32(bits: u32) -> f32 {
+    return bitcast<f32>(bits << 16u);
+}
+
+fn f32_to_bf16(val: f32) -> u32 {
+    return bitcast<u32>(val) >> 16u;
+}
+
+fn read_bf16(buf: ptr<storage, array<u32>, read>, idx: u32) -> f32 {
+    let packed = (*buf)[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>
+) {
+    let row_idx = wid.x;
+    let local_idx = lid.x;
+
+    if (row_idx >= params.num_rows) {
+        return;
+    }
+
+    let row_offset = params.input_offset + row_idx * params.hidden_size;
+
+    // Phase 1: Compute sum of squares
+    var local_sum_sq: f32 = 0.0;
+    var i: u32 = local_idx;
+    while (i < params.hidden_size) {
+        let val = read_bf16(&input, row_offset + i);
+        local_sum_sq += val * val;
+        i += 256u;
+    }
+
+    shared_data[local_idx] = local_sum_sq;
+    workgroupBarrier();
+
+    // Parallel reduction for sum of squares
+    var stride: u32 = 128u;
+    while (stride > 0u) {
+        if (local_idx < stride && local_idx + stride < 256u) {
+            shared_data[local_idx] += shared_data[local_idx + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+
+    let rms_inv = inverseSqrt(shared_data[0] / f32(params.hidden_size) + params.eps);
+    workgroupBarrier();
+
+    // Phase 2: Normalize and scale by alpha, write BF16 output
+    let out_row_offset = row_idx * params.hidden_size;
+    i = local_idx;
+    while (i < params.hidden_size) {
+        let val = read_bf16(&input, row_offset + i);
+        let alpha_val = read_bf16(&alpha, i);
+        let normed = val * rms_inv * alpha_val;
+
+        // Write BF16 packed u32 — handle pairs
+        // Each element writes to its half of the u32
+        let out_idx = out_row_offset + i;
+        let packed_idx = out_idx / 2u;
+        let is_high = (out_idx % 2u) == 1u;
+        let bf16_val = f32_to_bf16(normed);
+
+        // Since threads process different elements strided by 256, two threads
+        // might write to the same u32. Use atomicOr would be ideal but not available.
+        // Instead, process pairs: handle i and i+1 together if both are in range
+        // Simpler: write one element at a time using output as f32 temporarily,
+        // then convert. But that wastes memory.
+        // Simplest correct approach: each thread handles elements at stride 256,
+        // so consecutive threads never share a u32 (stride >= 2).
+        // Wait — i jumps by 256, so i and i+256 are far apart. No conflict.
+        // But i and i+1 (from different threads with local_idx differing by 1)
+        // DO share a u32!
+
+        // Solution: process in pairs. Thread handles 2 consecutive elements.
+        i += 256u;
+    }
+    // Rewrite: each thread processes pairs of consecutive elements
+    workgroupBarrier();
+    i = local_idx * 2u;
+    while (i < params.hidden_size) {
+        let out_idx = out_row_offset + i;
+
+        let val0 = read_bf16(&input, row_offset + i);
+        let alpha0 = read_bf16(&alpha, i);
+        let r0 = f32_to_bf16(val0 * rms_inv * alpha0);
+
+        var r1: u32 = 0u;
+        if (i + 1u < params.hidden_size) {
+            let val1 = read_bf16(&input, row_offset + i + 1u);
+            let alpha1 = read_bf16(&alpha, i + 1u);
+            r1 = f32_to_bf16(val1 * rms_inv * alpha1);
+        }
+
+        output[out_idx / 2u] = r0 | (r1 << 16u);
+        i += 512u; // 256 threads * 2 elements each
+    }
+}
+"#;
+
+/// BF16 RoPE (Rotary Positional Encoding) shader — writes F32 output
+/// Input: BF16 packed src [b*h, t*d], BF16 packed cos/sin [t, d/2]
+/// Output: F32 array (will be cast to BF16 by caller)
+/// Rotation: dst[i1] = src[i1]*cos - src[i2]*sin
+///           dst[i2] = src[i1]*sin + src[i2]*cos
+/// where i2 = i1 + d/2 (first/second halves of head_dim)
+pub const ROPE_BF16_SHADER: &str = r#"
+// BF16→F32 RoPE: src[bh, t*d](BF16) → dst[bh, t*d](F32)
+// Each thread handles one rotation pair (i_d in 0..d/2)
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read> cos_buf: array<u32>;
+@group(0) @binding(2) var<storage, read> sin_buf: array<u32>;
+@group(0) @binding(3) var<storage, read_write> dst: array<f32>;
+
+struct Params {
+    bh: u32,           // b * h
+    td: u32,           // t * d
+    d: u32,            // head_dim
+    stride_b: u32,     // 0 = unbatched cos/sin, >0 for batched
+    src_offset: u32,
+    cos_offset: u32,
+    sin_offset: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(4) var<uniform> params: Params;
+
+fn bf16_to_f32(bits: u32) -> f32 {
+    return bitcast<f32>(bits << 16u);
+}
+
+fn read_bf16(buf: ptr<storage, array<u32>, read>, idx: u32) -> f32 {
+    let packed = (*buf)[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let thread_idx = global_id.x;
+    let half_d = params.d / 2u;
+    let t = params.td / params.d;
+    let total_pairs = params.bh * t * half_d;
+
+    if (thread_idx >= total_pairs) {
+        return;
+    }
+
+    // Decompose: thread_idx → (bh_idx, t_idx, i_d)
+    let i_d = thread_idx % half_d;
+    let remaining = thread_idx / half_d;
+    let t_idx = remaining % t;
+    let bh_idx = remaining / t;
+
+    // Source indices
+    let base = params.src_offset + bh_idx * params.td;
+    let i1 = base + t_idx * params.d + i_d;
+    let i2 = i1 + half_d;
+
+    // Cos/sin index
+    let cs_offset = select(0u, bh_idx * params.td / 2u, params.stride_b > 0u);
+    let i_cs = params.cos_offset + cs_offset + t_idx * half_d + i_d;
+    let i_ss = params.sin_offset + cs_offset + t_idx * half_d + i_d;
+
+    let x1 = read_bf16(&src, i1);
+    let x2 = read_bf16(&src, i2);
+    let cos_val = read_bf16(&cos_buf, i_cs);
+    let sin_val = read_bf16(&sin_buf, i_ss);
+
+    // Write F32 output (no u32 packing race condition)
+    let out_base = bh_idx * params.td;
+    let o1 = out_base + t_idx * params.d + i_d;
+    let o2 = o1 + half_d;
+
+    dst[o1] = x1 * cos_val - x2 * sin_val;
+    dst[o2] = x1 * sin_val + x2 * cos_val;
+}
+"#;
+
 /// BF16 Layer Normalization shader
 /// Input: BF16 packed as u32 (2 BF16 per u32, little-endian)
 /// Gamma, Beta: BF16 packed as u32

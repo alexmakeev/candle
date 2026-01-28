@@ -219,6 +219,290 @@ impl WgpuStorage {
         Ok(bf16_output)
     }
 
+    /// BF16 RMS norm on GPU.
+    /// x: [num_rows, hidden_size] BF16, alpha: [hidden_size] BF16
+    /// output: [num_rows, hidden_size] BF16
+    pub fn rms_norm_bf16_gpu(
+        &self,
+        alpha: &Self,
+        x_layout: &Layout,
+        _alpha_layout: &Layout,
+        eps: f32,
+    ) -> Result<Self> {
+        let shape = x_layout.shape();
+        let dims = shape.dims();
+        let hidden_size = *dims.last().ok_or_else(|| {
+            crate::Error::Msg("rms_norm: empty shape".to_string())
+        })?;
+        let num_rows = shape.elem_count() / hidden_size;
+
+        let output_bytes = shape.elem_count() * 2; // BF16
+        let output_buffer = self.device.create_buffer(
+            output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "rms_norm_bf16_output",
+        );
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct RmsNormParams {
+            num_rows: u32,
+            hidden_size: u32,
+            eps: f32,
+            input_offset: u32,
+        }
+
+        let params = RmsNormParams {
+            num_rows: num_rows as u32,
+            hidden_size: hidden_size as u32,
+            eps,
+            input_offset: x_layout.start_offset() as u32,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "rms_norm_bf16_params",
+        );
+
+        self.device.with_pipeline(ShaderType::RmsNormBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rms_norm_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: alpha.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rms_norm_bf16_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rms_norm_bf16_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                // One workgroup per row
+                pass.dispatch_workgroups(num_rows as u32, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        Ok(WgpuStorage::new(
+            Arc::new(output_buffer),
+            self.device.clone(),
+            shape.elem_count(),
+            DType::BF16,
+        ))
+    }
+
+    /// BF16 softmax (last dim) on GPU.
+    /// x: [..., last_dim] BF16 contiguous
+    /// output: same shape, BF16
+    pub fn softmax_bf16_gpu(&self, layout: &Layout) -> Result<Self> {
+        let shape = layout.shape();
+        let dims = shape.dims();
+        let last_dim = *dims.last().ok_or_else(|| {
+            crate::Error::Msg("softmax: empty shape".to_string())
+        })?;
+        let num_rows = shape.elem_count() / last_dim;
+
+        // Softmax BF16 shader outputs F32, we need to cast back
+        let f32_output_bytes = shape.elem_count() * std::mem::size_of::<f32>();
+        let f32_output_buffer = self.device.create_buffer(
+            f32_output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "softmax_bf16_f32_output",
+        );
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct SoftmaxParams {
+            num_rows: u32,
+            row_size: u32,
+        }
+
+        let params = SoftmaxParams {
+            num_rows: num_rows as u32,
+            row_size: last_dim as u32,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "softmax_bf16_params",
+        );
+
+        self.device.with_pipeline(ShaderType::SoftmaxBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("softmax_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: f32_output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("softmax_bf16_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("softmax_bf16_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                // One workgroup per row
+                pass.dispatch_workgroups(num_rows as u32, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        // Cast F32 output back to BF16 on GPU
+        self.cast_f32_to_bf16_gpu(&f32_output_buffer, shape.elem_count())
+    }
+
+    /// BF16 RoPE on GPU. Returns BF16 output.
+    /// src: [b*h, t*d] BF16 (flat), cos/sin: [t, d/2] or [b*t, d/2] BF16
+    pub fn rope_bf16_gpu(
+        &self,
+        cos: &Self,
+        sin: &Self,
+        l_src: &Layout,
+        l_cos: &Layout,
+        l_sin: &Layout,
+    ) -> Result<Self> {
+        let (b, h, t, d) = l_src.shape().dims4()?;
+        let bh = b * h;
+        let td = t * d;
+        let el = bh * td;
+
+        let stride_b: u32 = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
+            (h * t * d) as u32
+        } else {
+            0u32
+        };
+
+        // F32 intermediate output
+        let f32_output_bytes = el * std::mem::size_of::<f32>();
+        let f32_output_buffer = self.device.create_buffer(
+            f32_output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "rope_bf16_f32_output",
+        );
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct RopeParams {
+            bh: u32,
+            td: u32,
+            d: u32,
+            stride_b: u32,
+            src_offset: u32,
+            cos_offset: u32,
+            sin_offset: u32,
+            _pad: u32,
+        }
+
+        let params = RopeParams {
+            bh: bh as u32,
+            td: td as u32,
+            d: d as u32,
+            stride_b,
+            src_offset: l_src.start_offset() as u32,
+            cos_offset: l_cos.start_offset() as u32,
+            sin_offset: l_sin.start_offset() as u32,
+            _pad: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "rope_bf16_params",
+        );
+
+        let half_d = d / 2;
+        let total_pairs = bh * t * half_d;
+        let workgroups = ((total_pairs as u32) + 255) / 256;
+
+        self.device.with_pipeline(ShaderType::RopeBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rope_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: cos.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: sin.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: f32_output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rope_bf16_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rope_bf16_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        // Cast F32 → BF16 on GPU
+        self.cast_f32_to_bf16_gpu(&f32_output_buffer, el)
+    }
+
     /// BF16 affine on GPU: y = x * mul + add. Input must be contiguous.
     fn affine_bf16_gpu(&self, layout: &Layout, mul_val: f32, add_val: f32) -> Result<Self> {
         let elem_count = layout.shape().elem_count();

@@ -1,6 +1,8 @@
 use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
 use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
+#[cfg(feature = "wgpu")]
+use crate::wgpu_backend::WgpuStorage;
 use std::sync::Arc;
 
 /// Unary ops that can be defined in user-land.
@@ -29,6 +31,18 @@ pub trait CustomOp1 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    /// The forward pass, as run on a wgpu device.
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        _storage: &WgpuStorage,
+        _layout: &Layout,
+    ) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(
+            format!("no wgpu implementation for {}", self.name()),
         ))
     }
 
@@ -78,6 +92,19 @@ pub trait CustomOp2 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(
+            format!("no wgpu implementation for {}", self.name()),
         ))
     }
 
@@ -136,6 +163,21 @@ pub trait CustomOp3 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(
+            format!("no wgpu implementation for {}", self.name()),
         ))
     }
 

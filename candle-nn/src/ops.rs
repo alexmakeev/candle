@@ -424,6 +424,23 @@ impl candle::CustomOp1 for SoftmaxLastDim {
             candle::MetalStorage::new(output, device.clone(), elem_count, storage.dtype());
         Ok((newstorage, layout.shape().clone()))
     }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        storage: &candle::WgpuStorage,
+        layout: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        if !layout.is_contiguous() {
+            candle::bail!("softmax-last-dim: input must be contiguous on wgpu");
+        }
+        if storage.dtype() != candle::DType::BF16 {
+            candle::bail!("softmax-last-dim on wgpu: only BF16 supported, got {:?}", storage.dtype());
+        }
+        let result = storage.softmax_bf16_gpu(layout)?;
+        Ok((result, layout.shape().clone()))
+    }
 }
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
@@ -617,6 +634,25 @@ impl candle::CustomOp2 for RmsNorm {
         let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        s1: &candle::WgpuStorage,
+        l1: &Layout,
+        s2: &candle::WgpuStorage,
+        l2: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        if !l1.is_contiguous() || !l2.is_contiguous() {
+            candle::bail!("rms-norm on wgpu: inputs must be contiguous");
+        }
+        if s1.dtype() != candle::DType::BF16 {
+            candle::bail!("rms-norm on wgpu: only BF16 supported, got {:?}", s1.dtype());
+        }
+        let result = s1.rms_norm_bf16_gpu(s2, l1, l2, self.eps)?;
+        Ok((result, l1.shape().clone()))
+    }
 }
 
 pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
@@ -641,11 +677,6 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             xs.shape(),
             alpha.shape()
         )
-    }
-    // wgpu does not have a custom RmsNorm kernel — use the generic tensor-op path
-    #[cfg(feature = "wgpu")]
-    if xs.device().is_wgpu() {
-        return rms_norm_slow(xs, alpha, eps);
     }
     xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
 }

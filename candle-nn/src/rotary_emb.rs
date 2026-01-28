@@ -507,6 +507,27 @@ impl candle::CustomOp3 for RotaryEmb {
         let out = candle::MetalStorage::new(output, device.clone(), el, src.dtype());
         Ok((out, l_src.shape().clone()))
     }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        s1: &candle::WgpuStorage,
+        l1: &Layout,
+        s2: &candle::WgpuStorage,
+        l2: &Layout,
+        s3: &candle::WgpuStorage,
+        l3: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        if !l1.is_contiguous() || !l2.is_contiguous() || !l3.is_contiguous() {
+            candle::bail!("rope on wgpu: all inputs must be contiguous");
+        }
+        if s1.dtype() != candle::DType::BF16 {
+            candle::bail!("rope on wgpu: only BF16 supported, got {:?}", s1.dtype());
+        }
+        let result = s1.rope_bf16_gpu(s2, s3, l1, l2, l3)?;
+        Ok((result, l1.shape().clone()))
+    }
 }
 
 pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -533,11 +554,6 @@ pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     }
     if !sin.is_contiguous() {
         candle::bail!("sin has to be contiguous in rope")
-    }
-    // wgpu does not have a custom RotaryEmb kernel — use the generic tensor-op path
-    #[cfg(feature = "wgpu")]
-    if xs.device().is_wgpu() {
-        return rope_slow(xs, cos, sin);
     }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmb)
 }
