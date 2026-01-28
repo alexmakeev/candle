@@ -1379,6 +1379,50 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
+/// BF16 index select (dim=0) shader
+/// Copies rows from BF16 source based on U32 index array.
+/// Used for embedding lookup: src[vocab, hidden] + ids[seq_len] → out[seq_len, hidden]
+/// Assumes row_size is even (always true for hidden_size in LLMs).
+/// Each thread copies one u32 (pair of BF16 elements).
+pub const INDEX_SELECT_BF16_SHADER: &str = r#"
+// BF16 index select (dim=0): copies full rows by index
+// src: BF16 packed as u32 [num_src_rows, row_size/2]
+// indices: U32 array [num_indices]
+// output: BF16 packed as u32 [num_indices, row_size/2]
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read> indices: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<u32>;
+
+struct Params {
+    num_indices: u32,
+    row_size: u32,      // in BF16 elements (must be even)
+    src_offset: u32,    // in BF16 elements
+    ids_offset: u32,
+}
+
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let u32_idx = global_id.x;
+    let pairs_per_row = params.row_size / 2u;
+    let total_u32s = params.num_indices * pairs_per_row;
+
+    if (u32_idx >= total_u32s) {
+        return;
+    }
+
+    let out_row = u32_idx / pairs_per_row;
+    let col_pair = u32_idx % pairs_per_row;
+
+    let src_row = indices[params.ids_offset + out_row];
+    let src_u32_idx = (params.src_offset / 2u) + src_row * pairs_per_row + col_pair;
+
+    output[u32_idx] = src[src_u32_idx];
+}
+"#;
+
 /// BF16 Layer Normalization shader
 /// Input: BF16 packed as u32 (2 BF16 per u32, little-endian)
 /// Gamma, Beta: BF16 packed as u32

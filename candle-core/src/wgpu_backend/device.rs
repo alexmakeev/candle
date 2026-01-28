@@ -46,6 +46,7 @@ pub enum ShaderType {
     AffineBF16,
     RmsNormBF16,
     RopeBF16,
+    IndexSelectBF16,
 }
 
 /// Unique identifier for a wgpu device
@@ -227,6 +228,7 @@ impl WgpuDevice {
             ShaderType::AffineBF16 => (ops::AFFINE_BF16_SHADER, "affine_bf16"),
             ShaderType::RmsNormBF16 => (ops::RMS_NORM_BF16_SHADER, "rms_norm_bf16"),
             ShaderType::RopeBF16 => (ops::ROPE_BF16_SHADER, "rope_bf16"),
+            ShaderType::IndexSelectBF16 => (ops::INDEX_SELECT_BF16_SHADER, "index_select_bf16"),
         };
 
         let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -412,6 +414,18 @@ impl WgpuDevice {
                         storage_entry(2, true),
                         storage_entry(3, false),
                         uniform_entry(4),
+                    ],
+                })
+            }
+            ShaderType::IndexSelectBF16 => {
+                // src(read), indices(read), output(write), params(uniform)
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        storage_entry(0, true),
+                        storage_entry(1, true),
+                        storage_entry(2, false),
+                        uniform_entry(3),
                     ],
                 })
             }

@@ -893,6 +893,179 @@ impl WgpuStorage {
         ))
     }
 
+    /// F32 reduce (Sum or Max) along last dimension on GPU.
+    /// Input: F32 buffer [num_rows, row_size]
+    /// Output: F32 buffer [num_rows]
+    fn reduce_f32_last_dim_gpu(
+        &self,
+        f32_buffer: &wgpu::Buffer,
+        num_rows: usize,
+        row_size: usize,
+        shader_type: ShaderType,
+    ) -> Result<wgpu::Buffer> {
+        let output_bytes = num_rows * std::mem::size_of::<f32>();
+        let output_buffer = self.device.create_buffer(
+            output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "reduce_f32_output",
+        );
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct ReduceParams {
+            num_rows: u32,
+            row_size: u32,
+        }
+
+        let params = ReduceParams {
+            num_rows: num_rows as u32,
+            row_size: row_size as u32,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "reduce_f32_params",
+        );
+
+        self.device.with_pipeline(shader_type, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("reduce_f32_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: f32_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("reduce_f32_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("reduce_f32_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                // One workgroup per row
+                pass.dispatch_workgroups(num_rows as u32, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        Ok(output_buffer)
+    }
+
+    /// BF16 index select (dim=0) on GPU.
+    /// Copies rows from BF16 source based on U32 index array.
+    fn index_select_bf16_dim0_gpu(
+        &self,
+        ids: &Self,
+        src_layout: &Layout,
+        ids_layout: &Layout,
+    ) -> Result<Self> {
+        let src_dims = src_layout.dims();
+        let row_size = if src_dims.len() >= 2 {
+            src_dims[1..].iter().product::<usize>()
+        } else {
+            1
+        };
+        let num_indices = ids_layout.shape().elem_count();
+        let output_elem_count = num_indices * row_size;
+        let output_bytes = output_elem_count * 2; // BF16
+
+        let output_buffer = self.device.create_buffer(
+            output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "index_select_bf16_output",
+        );
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct IndexSelectParams {
+            num_indices: u32,
+            row_size: u32,
+            src_offset: u32,
+            ids_offset: u32,
+        }
+
+        let params = IndexSelectParams {
+            num_indices: num_indices as u32,
+            row_size: row_size as u32,
+            src_offset: src_layout.start_offset() as u32,
+            ids_offset: ids_layout.start_offset() as u32,
+        };
+        let params_buffer = self.device.create_buffer_init(
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+            "index_select_bf16_params",
+        );
+
+        let pairs_per_row = row_size / 2;
+        let total_u32s = num_indices * pairs_per_row;
+        let workgroups = ((total_u32s as u32) + 255) / 256;
+
+        self.device.with_pipeline(ShaderType::IndexSelectBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("index_select_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: ids.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("index_select_bf16_encoder"),
+            });
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("index_select_bf16_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        Ok(WgpuStorage::new(
+            Arc::new(output_buffer),
+            self.device.clone(),
+            output_elem_count,
+            DType::BF16,
+        ))
+    }
+
     fn matmul_gpu(&self, rhs: &Self, m: usize, n: usize, k: usize) -> Result<Self> {
         let output_size = m * n;
         let output_bytes = output_size * std::mem::size_of::<f32>();
@@ -1026,6 +1199,81 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, dims: &[usize]) -> Result<Self> {
+        // GPU path for BF16: last-dim-only Sum/Max via composition
+        // BF16→F32 cast + F32 reduce shader + F32→BF16 cast
+        if self.dtype == DType::BF16 && layout.is_contiguous() && dims.len() == 1 {
+            let ndims = layout.dims().len();
+            let reduce_dim = dims[0];
+            if reduce_dim == ndims - 1 {
+                let shape = layout.shape();
+                let last_dim = layout.dims()[ndims - 1];
+                let num_rows = shape.elem_count() / last_dim;
+
+                let shader_type = match op {
+                    ReduceOp::Sum => ShaderType::ReduceSumLastDim,
+                    ReduceOp::Max => ShaderType::ReduceMaxLastDim,
+                    ReduceOp::Min => ShaderType::ReduceMaxLastDim, // Min handled below
+                    _ => {
+                        return self.from_cpu_op(layout, |cpu, l| cpu.reduce_op(op, l, dims));
+                    }
+                };
+
+                // For Min: negate, reduce max, negate back. Or just use CPU for now.
+                if matches!(op, ReduceOp::Min) {
+                    return self.from_cpu_op(layout, |cpu, l| cpu.reduce_op(op, l, dims));
+                }
+
+                // Cast BF16→F32 on GPU
+                let f32_storage = self.cast_bf16_to_f32_gpu(&self.buffer, self.count)?;
+
+                // Reduce F32 on GPU
+                let reduced_f32_buffer = self.reduce_f32_last_dim_gpu(
+                    f32_storage.buffer(),
+                    num_rows,
+                    last_dim,
+                    shader_type,
+                )?;
+
+                // Cast F32→BF16 on GPU
+                let bf16_result = self.cast_f32_to_bf16_gpu(&reduced_f32_buffer, num_rows)?;
+
+                return Ok(bf16_result);
+            }
+        }
+
+        // GPU path for F32: last-dim-only Sum/Max
+        if self.dtype == DType::F32 && layout.is_contiguous() && dims.len() == 1 {
+            let ndims = layout.dims().len();
+            let reduce_dim = dims[0];
+            if reduce_dim == ndims - 1 {
+                let shape = layout.shape();
+                let last_dim = layout.dims()[ndims - 1];
+                let num_rows = shape.elem_count() / last_dim;
+
+                let shader_type = match op {
+                    ReduceOp::Sum => ShaderType::ReduceSumLastDim,
+                    ReduceOp::Max => ShaderType::ReduceMaxLastDim,
+                    _ => {
+                        return self.from_cpu_op(layout, |cpu, l| cpu.reduce_op(op, l, dims));
+                    }
+                };
+
+                let reduced_buffer = self.reduce_f32_last_dim_gpu(
+                    &self.buffer,
+                    num_rows,
+                    last_dim,
+                    shader_type,
+                )?;
+
+                return Ok(WgpuStorage::new(
+                    Arc::new(reduced_buffer),
+                    self.device.clone(),
+                    num_rows,
+                    DType::F32,
+                ));
+            }
+        }
+
         self.from_cpu_op(layout, |cpu, l| cpu.reduce_op(op, l, dims))
     }
 
@@ -1252,6 +1500,20 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
+        // GPU path for BF16 dim=0 (embedding lookup) with even row_size
+        if self.dtype == DType::BF16 && dim == 0 && l.is_contiguous() && ids_l.is_contiguous() {
+            let src_dims = l.dims();
+            let row_size = if src_dims.len() >= 2 {
+                src_dims[1..].iter().product::<usize>()
+            } else {
+                1
+            };
+            // Shader requires even row_size for u32 packing alignment
+            if row_size % 2 == 0 {
+                return self.index_select_bf16_dim0_gpu(ids, l, ids_l);
+            }
+        }
+
         let src_cpu = self.to_cpu_storage()?;
         let ids_cpu = ids.to_cpu_storage()?;
         let result = src_cpu.index_select(&ids_cpu, l, ids_l, dim)?;
