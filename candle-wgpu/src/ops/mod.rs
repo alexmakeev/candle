@@ -539,6 +539,121 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
+/// BF16 fused softmax shader
+/// Input: BF16 packed as u32 (2 BF16 per u32, little-endian)
+/// Output: F32 array (will be converted to BF16 on CPU)
+/// Computes softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
+pub const SOFTMAX_BF16_SHADER: &str = r#"
+// BF16 Fused softmax along last dimension
+// Input: BF16 packed as u32 (2 BF16 per u32)
+// Output: F32 array
+
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct Params {
+    num_rows: u32,
+    row_size: u32,
+}
+
+@group(0) @binding(2) var<uniform> params: Params;
+
+var<workgroup> shared_data: array<f32, 256>;
+
+// Convert BF16 (16-bit) to F32
+fn bf16_to_f32(bits: u32) -> f32 {
+    return bitcast<f32>(bits << 16u);
+}
+
+// Read BF16 value at logical index
+fn read_bf16(idx: u32) -> f32 {
+    let packed_idx = idx / 2u;
+    let is_high = (idx % 2u) == 1u;
+    let packed = input[packed_idx];
+    let bf16_bits = select(
+        packed & 0xFFFFu,
+        packed >> 16u,
+        is_high
+    );
+    return bf16_to_f32(bf16_bits);
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>
+) {
+    let row_idx = wid.x;
+    let local_idx = lid.x;
+
+    if (row_idx >= params.num_rows) {
+        return;
+    }
+
+    let row_offset = row_idx * params.row_size;
+
+    // === Phase 1: Find max ===
+    var local_max: f32 = -3.4028235e+38;
+    var i: u32 = local_idx;
+    while (i < params.row_size) {
+        let val = read_bf16(row_offset + i);
+        local_max = max(local_max, val);
+        i += 256u;
+    }
+
+    shared_data[local_idx] = local_max;
+    workgroupBarrier();
+
+    // Reduce to find global max
+    var stride: u32 = 128u;
+    while (stride > 0u) {
+        if (local_idx < stride && local_idx + stride < 256u) {
+            shared_data[local_idx] = max(shared_data[local_idx], shared_data[local_idx + stride]);
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+
+    let row_max = shared_data[0];
+    workgroupBarrier();
+
+    // === Phase 2: Compute exp(x - max) and sum ===
+    var local_sum: f32 = 0.0;
+    i = local_idx;
+    while (i < params.row_size) {
+        let val = read_bf16(row_offset + i);
+        let exp_val = exp(val - row_max);
+        output[row_offset + i] = exp_val;
+        local_sum += exp_val;
+        i += 256u;
+    }
+
+    shared_data[local_idx] = local_sum;
+    workgroupBarrier();
+
+    // Reduce to find sum
+    stride = 128u;
+    while (stride > 0u) {
+        if (local_idx < stride && local_idx + stride < 256u) {
+            shared_data[local_idx] += shared_data[local_idx + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+
+    let row_sum = shared_data[0];
+    workgroupBarrier();
+
+    // === Phase 3: Normalize ===
+    i = local_idx;
+    while (i < params.row_size) {
+        output[row_offset + i] /= row_sum;
+        i += 256u;
+    }
+}
+"#;
+
 /// Fused softmax shader - does everything in one kernel
 /// This is more efficient than separate max/sub/exp/sum/div operations
 pub const SOFTMAX_FUSED_SHADER: &str = r#"
@@ -630,6 +745,111 @@ fn main(
     while (i < params.row_size) {
         output[row_offset + i] /= row_sum;
         i += 256u;
+    }
+}
+"#;
+
+
+/// BF16 Layer Normalization shader
+/// Input: BF16 packed as u32 (2 BF16 per u32, little-endian)
+/// Gamma, Beta: BF16 packed as u32
+/// Output: F32 array (will be converted to BF16 on CPU)
+/// Computes: y = (x - mean) / sqrt(var + eps) * gamma + beta
+pub const LAYER_NORM_BF16_SHADER: &str = r#"
+// BF16 Layer Normalization
+// Input, gamma, beta: BF16 packed as u32 (2 BF16 per u32)
+// Output: F32 array
+
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> gamma: array<u32>;
+@group(0) @binding(2) var<storage, read> beta: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+struct Params {
+    batch_size: u32,
+    hidden_size: u32,
+    eps: f32,
+    _padding: u32,
+}
+
+@group(0) @binding(4) var<uniform> params: Params;
+
+// Convert BF16 (16-bit) to F32
+fn bf16_to_f32(bits: u32) -> f32 {
+    return bitcast<f32>(bits << 16u);
+}
+
+// Read BF16 value at logical index from input
+fn read_input_bf16(idx: u32) -> f32 {
+    let packed_idx = idx / 2u;
+    let is_high = (idx % 2u) == 1u;
+    let packed = input[packed_idx];
+    let bf16_bits = select(
+        packed & 0xFFFFu,
+        packed >> 16u,
+        is_high
+    );
+    return bf16_to_f32(bf16_bits);
+}
+
+// Read BF16 value from gamma
+fn read_gamma_bf16(idx: u32) -> f32 {
+    let packed_idx = idx / 2u;
+    let is_high = (idx % 2u) == 1u;
+    let packed = gamma[packed_idx];
+    let bf16_bits = select(
+        packed & 0xFFFFu,
+        packed >> 16u,
+        is_high
+    );
+    return bf16_to_f32(bf16_bits);
+}
+
+// Read BF16 value from beta
+fn read_beta_bf16(idx: u32) -> f32 {
+    let packed_idx = idx / 2u;
+    let is_high = (idx % 2u) == 1u;
+    let packed = beta[packed_idx];
+    let bf16_bits = select(
+        packed & 0xFFFFu,
+        packed >> 16u,
+        is_high
+    );
+    return bf16_to_f32(bf16_bits);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let batch_idx = global_id.x;
+
+    if (batch_idx >= params.batch_size) {
+        return;
+    }
+
+    let offset = batch_idx * params.hidden_size;
+
+    // Compute mean
+    var mean: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.hidden_size; i = i + 1u) {
+        mean = mean + read_input_bf16(offset + i);
+    }
+    mean = mean / f32(params.hidden_size);
+
+    // Compute variance
+    var variance: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.hidden_size; i = i + 1u) {
+        let diff = read_input_bf16(offset + i) - mean;
+        variance = variance + diff * diff;
+    }
+    variance = variance / f32(params.hidden_size);
+
+    // Normalize and apply scale/shift
+    let std_inv = 1.0 / sqrt(variance + params.eps);
+    for (var i: u32 = 0u; i < params.hidden_size; i = i + 1u) {
+        let normalized = (read_input_bf16(offset + i) - mean) * std_inv;
+        let gamma_val = read_gamma_bf16(i);
+        let beta_val = read_beta_bf16(i);
+        output[offset + i] = normalized * gamma_val + beta_val;
     }
 }
 "#;

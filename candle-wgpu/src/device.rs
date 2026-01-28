@@ -44,6 +44,10 @@ pub enum ShaderType {
     BroadcastSub,
     /// Broadcast division (x / value broadcasted)
     BroadcastDiv,
+    /// BF16 fused softmax (stored as u16, computed as f32)
+    SoftmaxBF16,
+    /// BF16 layer normalization (stored as u16, computed as f32)
+    LayerNormBF16,
 }
 
 /// Unique identifier for a wgpu device
@@ -200,6 +204,8 @@ impl WgpuDevice {
             ShaderType::ExpF32 => (ops::EXP_SHADER, "exp_f32"),
             ShaderType::BroadcastSub => (ops::BROADCAST_SUB_SHADER, "broadcast_sub"),
             ShaderType::BroadcastDiv => (ops::BROADCAST_DIV_SHADER, "broadcast_div"),
+            ShaderType::SoftmaxBF16 => (ops::SOFTMAX_BF16_SHADER, "softmax_bf16"),
+            ShaderType::LayerNormBF16 => (ops::LAYER_NORM_BF16_SHADER, "layer_norm_bf16"),
         };
 
         let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -591,6 +597,110 @@ impl WgpuDevice {
                         // Params (uniform)
                         wgpu::BindGroupLayoutEntry {
                             binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ShaderType::SoftmaxBF16 => {
+                // BF16 softmax: input (BF16 packed), output (F32), params
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // Input (BF16 packed as u32)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Output (F32)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ShaderType::LayerNormBF16 => {
+                // BF16 layer norm: input (BF16), gamma (BF16), beta (BF16), output (F32), params
+                self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(&format!("{}_bind_group_layout", label)),
+                    entries: &[
+                        // Input (BF16 packed as u32)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Gamma (BF16 packed as u32)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Beta (BF16 packed as u32)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Output (F32)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
                             visibility: wgpu::ShaderStages::COMPUTE,
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,

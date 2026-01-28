@@ -282,6 +282,102 @@ pub fn reduce_sum_last_dim_gpu(
     ))
 }
 
+/// GPU-accelerated BF16 softmax along the last dimension
+///
+/// Input: BF16 stored as u16
+/// Computation: Convert to F32, compute softmax, return F32 (to be converted to BF16 on CPU)
+///
+/// # Arguments
+/// * `device` - The wgpu device
+/// * `input` - Input tensor data (BF16 stored as u16, flattened, row-major)
+/// * `num_rows` - Number of rows
+/// * `row_size` - Size of each row (the dimension to softmax over)
+///
+/// # Returns
+/// Output tensor data in F32 (caller converts to BF16 if needed)
+pub fn softmax_bf16_gpu(
+    device: &WgpuDevice,
+    input: &WgpuStorage,
+    num_rows: usize,
+    row_size: usize,
+) -> candle_core::Result<WgpuStorage> {
+    use candle_core::DType;
+
+    assert_eq!(input.dtype(), DType::BF16, "softmax_bf16_gpu requires BF16 input");
+    assert_eq!(input.count(), num_rows * row_size);
+
+    let output_size = num_rows * row_size;
+    let output_bytes = output_size * std::mem::size_of::<f32>();
+
+    // Create F32 output buffer
+    let output_buffer = device.create_buffer(
+        output_bytes as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        "softmax_bf16_output",
+    );
+
+    // Create params buffer
+    let params = SoftmaxParams {
+        num_rows: num_rows as u32,
+        row_size: row_size as u32,
+    };
+    let params_bytes = bytemuck::bytes_of(&params);
+    let params_buffer = device.create_buffer_init(
+        params_bytes,
+        wgpu::BufferUsages::UNIFORM,
+        "softmax_bf16_params",
+    );
+
+    // Execute BF16 softmax shader
+    device.with_pipeline(ShaderType::SoftmaxBF16, |cached| {
+        let bind_group = device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("softmax_bf16_bind_group"),
+            layout: &cached.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("softmax_bf16_encoder"),
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("softmax_bf16_pass"),
+                timestamp_writes: None,
+            });
+
+            pass.set_pipeline(&cached.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+
+            // One workgroup per row
+            pass.dispatch_workgroups(num_rows as u32, 1, 1);
+        }
+
+        device.queue().submit(std::iter::once(encoder.finish()));
+    });
+
+    // Return F32 output (caller can convert to BF16 if needed)
+    Ok(WgpuStorage::new(
+        Arc::new(output_buffer),
+        device.clone(),
+        output_size,
+        DType::F32,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,5 +675,133 @@ mod tests {
         }
 
         println!("✅ Softmax numerical stability test passed!");
+    }
+
+    #[test]
+    fn test_bf16_softmax() {
+        if !is_available() {
+            println!("Skipping test: no wgpu adapter available");
+            return;
+        }
+
+        let device = WgpuDevice::new(0).expect("Failed to create wgpu device");
+        let info = device.adapter_info();
+        println!("Testing BF16 softmax on: {} ({:?})", info.name, info.backend);
+
+        // Test case: 2 rows × 4 elements
+        let num_rows = 2;
+        let row_size = 4;
+        let input_f32: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0,  // row 0
+            2.0, 4.0, 6.0, 8.0,  // row 1
+        ];
+
+        // Convert to BF16
+        let input_bf16: Vec<half::bf16> = input_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+
+        // Create input storage as BF16
+        let input_storage = device.storage_from_slice(&input_bf16).expect("Failed to create storage");
+
+        // Run GPU BF16 softmax (returns F32)
+        let output_storage = softmax_bf16_gpu(&device, &input_storage, num_rows, row_size)
+            .expect("bf16 softmax failed");
+
+        // Read back result (F32)
+        let output_cpu = output_storage.to_cpu_storage().expect("Failed to read back");
+        let output: Vec<f32> = match output_cpu {
+            candle_core::CpuStorage::F32(data) => data,
+            _ => panic!("Unexpected dtype"),
+        };
+
+        // Compute expected on CPU (using F32 for reference)
+        let expected = cpu_softmax(&input_f32, num_rows, row_size);
+
+        println!("Input F32: {:?}", input_f32);
+        println!("GPU BF16 output: {:?}", output);
+        println!("CPU F32 expected: {:?}", expected);
+
+        // Verify results (BF16 has less precision, so allow larger error)
+        for i in 0..output.len() {
+            let error = (output[i] - expected[i]).abs();
+            assert!(
+                error < 1e-3,
+                "Mismatch at index {}: got {}, expected {}, error {}",
+                i, output[i], expected[i], error
+            );
+        }
+
+        // Verify softmax properties
+        for row in 0..num_rows {
+            let offset = row * row_size;
+            let row_sum: f32 = output[offset..offset + row_size].iter().sum();
+            assert!(
+                (row_sum - 1.0).abs() < 1e-4,
+                "Row {} sum should be 1.0, got {}",
+                row, row_sum
+            );
+
+            for i in 0..row_size {
+                assert!(
+                    output[offset + i] >= 0.0 && output[offset + i] <= 1.0,
+                    "Softmax output should be in [0, 1]"
+                );
+            }
+        }
+
+        println!("✅ BF16 softmax test passed!");
+    }
+
+    #[test]
+    fn test_bf16_softmax_large() {
+        if !is_available() {
+            println!("Skipping test: no wgpu adapter available");
+            return;
+        }
+
+        let device = WgpuDevice::new(0).expect("Failed to create wgpu device");
+        println!("Testing large BF16 softmax on: {}", device.adapter_info().name);
+
+        // Larger test: 64 rows × 256 elements
+        let num_rows = 64;
+        let row_size = 256;
+        let input_f32: Vec<f32> = (0..num_rows * row_size)
+            .map(|i| (i as f32 * 0.01).sin())
+            .collect();
+
+        // Convert to BF16
+        let input_bf16: Vec<half::bf16> = input_f32.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let input_storage = device.storage_from_slice(&input_bf16).expect("Failed to create storage");
+
+        let output_storage = softmax_bf16_gpu(&device, &input_storage, num_rows, row_size)
+            .expect("bf16 softmax failed");
+
+        let output_cpu = output_storage.to_cpu_storage().expect("Failed to read back");
+        let output: Vec<f32> = match output_cpu {
+            candle_core::CpuStorage::F32(data) => data,
+            _ => panic!("Unexpected dtype"),
+        };
+
+        let expected = cpu_softmax(&input_f32, num_rows, row_size);
+
+        // Check error
+        let mut max_error = 0.0f32;
+        for i in 0..output.len() {
+            max_error = max_error.max((output[i] - expected[i]).abs());
+        }
+        println!("Max error: {:.6e}", max_error);
+        assert!(max_error < 1e-2, "Max error too large: {}", max_error);
+
+        // Check row sums
+        for row in 0..num_rows {
+            let offset = row * row_size;
+            let row_sum: f32 = output[offset..offset + row_size].iter().sum();
+            assert!(
+                (row_sum - 1.0).abs() < 1e-3,
+                "Row {} sum should be 1.0, got {}",
+                row, row_sum
+            );
+        }
+
+        println!("✅ Large BF16 softmax test passed! ({} × {})", num_rows, row_size);
     }
 }
