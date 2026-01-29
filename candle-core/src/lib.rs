@@ -125,7 +125,7 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(feature = "wgpu")]
-pub use wgpu_backend::{WgpuDevice, WgpuError, WgpuStorage};
+pub use wgpu_backend::{shader_flags, WgpuDevice, WgpuError, WgpuStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

@@ -432,6 +432,13 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         layout: &Layout,
     ) -> Result<(candle::WgpuStorage, Shape)> {
         use candle::backend::BackendStorage;
+        if !candle::shader_flags().softmax {
+            eprintln!("[WGPU-TRACE] softmax CPU fallback (flag off)");
+            let cpu = storage.to_cpu_storage()?;
+            let cpu_result = self.cpu_fwd(&cpu, layout)?;
+            let gpu = candle::backend::BackendDevice::storage_from_cpu_storage(storage.device(), &cpu_result.0)?;
+            return Ok((gpu, cpu_result.1));
+        }
         if !layout.is_contiguous() {
             candle::bail!("softmax-last-dim: input must be contiguous on wgpu");
         }
@@ -646,6 +653,14 @@ impl candle::CustomOp2 for RmsNorm {
         l2: &Layout,
     ) -> Result<(candle::WgpuStorage, Shape)> {
         use candle::backend::BackendStorage;
+        if !candle::shader_flags().rms_norm {
+            eprintln!("[WGPU-TRACE] rms_norm CPU fallback (flag off)");
+            let cpu1 = s1.to_cpu_storage()?;
+            let cpu2 = s2.to_cpu_storage()?;
+            let cpu_result = self.cpu_fwd(&cpu1, l1, &cpu2, l2)?;
+            let gpu = candle::backend::BackendDevice::storage_from_cpu_storage(s1.device(), &cpu_result.0)?;
+            return Ok((gpu, cpu_result.1));
+        }
         if !l1.is_contiguous() || !l2.is_contiguous() {
             candle::bail!("rms-norm on wgpu: inputs must be contiguous");
         }

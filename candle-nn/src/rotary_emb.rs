@@ -519,6 +519,15 @@ impl candle::CustomOp3 for RotaryEmb {
         l3: &Layout,
     ) -> Result<(candle::WgpuStorage, Shape)> {
         use candle::backend::BackendStorage;
+        if !candle::shader_flags().rope {
+            eprintln!("[WGPU-TRACE] rope CPU fallback (flag off)");
+            let cpu1 = s1.to_cpu_storage()?;
+            let cpu2 = s2.to_cpu_storage()?;
+            let cpu3 = s3.to_cpu_storage()?;
+            let cpu_result = self.cpu_fwd(&cpu1, l1, &cpu2, l2, &cpu3, l3)?;
+            let gpu = candle::backend::BackendDevice::storage_from_cpu_storage(s1.device(), &cpu_result.0)?;
+            return Ok((gpu, cpu_result.1));
+        }
         if !l1.is_contiguous() || !l2.is_contiguous() || !l3.is_contiguous() {
             candle::bail!("rope on wgpu: all inputs must be contiguous");
         }

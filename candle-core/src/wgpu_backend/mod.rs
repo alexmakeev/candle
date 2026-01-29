@@ -5,12 +5,14 @@
 
 mod device;
 mod error;
+pub mod flags;
 pub mod ops;
 pub mod quantized;
 mod storage;
 
 pub use device::{CachedPipeline, DeviceId, ShaderType, WgpuDevice};
 pub use error::WgpuError;
+pub use flags::shader_flags;
 pub use storage::WgpuStorage;
 
 /// Check if wgpu is available on this system

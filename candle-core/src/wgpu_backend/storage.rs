@@ -2,6 +2,7 @@
 
 use super::device::{ShaderType, WgpuDevice};
 use super::error::WgpuError;
+use super::flags::shader_flags;
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
@@ -1324,7 +1325,7 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
-        if self.dtype == DType::BF16 && layout.is_contiguous() {
+        if self.dtype == DType::BF16 && layout.is_contiguous() && shader_flags().affine_bf16 {
             eprintln!("[WGPU-TRACE] affine BF16 GPU, shape={:?}", layout.shape());
             return self.affine_bf16_gpu(layout, mul as f32, add as f32);
         }
@@ -1344,7 +1345,7 @@ impl BackendStorage for WgpuStorage {
         eprintln!("[WGPU-TRACE] reduce_op {:?}, dtype={:?}, shape={:?}, dims={:?}", op, self.dtype, layout.shape(), dims);
         // GPU path for BF16: last-dim-only Sum/Max via composition
         // BF16→F32 cast + F32 reduce shader + F32→BF16 cast
-        if self.dtype == DType::BF16 && layout.is_contiguous() && dims.len() == 1 {
+        if self.dtype == DType::BF16 && layout.is_contiguous() && dims.len() == 1 && shader_flags().reduce {
             let ndims = layout.dims().len();
             let reduce_dim = dims[0];
             if reduce_dim == ndims - 1 {
@@ -1385,7 +1386,7 @@ impl BackendStorage for WgpuStorage {
         }
 
         // GPU path for F32: last-dim-only Sum/Max
-        if self.dtype == DType::F32 && layout.is_contiguous() && dims.len() == 1 {
+        if self.dtype == DType::F32 && layout.is_contiguous() && dims.len() == 1 && shader_flags().reduce {
             let ndims = layout.dims().len();
             let reduce_dim = dims[0];
             if reduce_dim == ndims - 1 {
@@ -1429,7 +1430,7 @@ impl BackendStorage for WgpuStorage {
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         eprintln!("[WGPU-TRACE] to_dtype {:?}->{:?} shape={:?} contig={}", self.dtype, dtype, layout.shape(), layout.is_contiguous());
         // GPU-native BF16↔F32 casts (contiguous only)
-        if layout.is_contiguous() {
+        if layout.is_contiguous() && shader_flags().cast {
             match (self.dtype, dtype) {
                 (DType::BF16, DType::F32) => {
                     return self.cast_bf16_to_f32_gpu(&self.buffer, self.count);
@@ -1449,7 +1450,7 @@ impl BackendStorage for WgpuStorage {
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         eprintln!("[WGPU-TRACE] unary {} dtype={:?} shape={:?} contig={}", B::NAME, self.dtype, layout.shape(), layout.is_contiguous());
         // GPU path for BF16 contiguous tensors
-        if self.dtype == DType::BF16 && layout.is_contiguous() {
+        if self.dtype == DType::BF16 && layout.is_contiguous() && shader_flags().unary_bf16 {
             let op_type: u32 = match B::NAME {
                 "exp" => 0,
                 "log" => 1,
@@ -1481,7 +1482,7 @@ impl BackendStorage for WgpuStorage {
     fn binary_impl<B: BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
         eprintln!("[WGPU-TRACE] binary {} dtype={:?} lhs={:?} rhs={:?} contig={}/{}", B::NAME, self.dtype, lhs_l.shape(), rhs_l.shape(), lhs_l.is_contiguous(), rhs_l.is_contiguous());
         // GPU path for BF16 contiguous tensors
-        if self.dtype == DType::BF16 && lhs_l.is_contiguous() && rhs_l.is_contiguous() {
+        if self.dtype == DType::BF16 && lhs_l.is_contiguous() && rhs_l.is_contiguous() && shader_flags().binary_bf16 {
             let op_type: u32 = match B::NAME {
                 "add" => 0,
                 "sub" => 1,
@@ -1648,7 +1649,7 @@ impl BackendStorage for WgpuStorage {
     fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
         eprintln!("[WGPU-TRACE] index_select dim={} dtype={:?} src_shape={:?} ids_shape={:?}", dim, self.dtype, l.shape(), ids_l.shape());
         // GPU path for BF16 dim=0 (embedding lookup) with even row_size
-        if self.dtype == DType::BF16 && dim == 0 && l.is_contiguous() && ids_l.is_contiguous() {
+        if self.dtype == DType::BF16 && dim == 0 && l.is_contiguous() && ids_l.is_contiguous() && shader_flags().index_select {
             let src_dims = l.dims();
             let row_size = if src_dims.len() >= 2 {
                 src_dims[1..].iter().product::<usize>()
@@ -1697,7 +1698,7 @@ impl BackendStorage for WgpuStorage {
         let is_unbatched = b == 1;
 
         // BF16 GPU matmul (supports batched)
-        if self.dtype == DType::BF16 && is_contiguous {
+        if self.dtype == DType::BF16 && is_contiguous && shader_flags().matmul_bf16 {
             return self.matmul_bf16_gpu(rhs, b, m, n, k);
         }
 
@@ -1744,8 +1745,11 @@ impl BackendStorage for WgpuStorage {
             return Ok(());
         }
 
-        // Non-contiguous: CPU fallback for now
-        // TODO: debug COPY_STRIDED_BF16_SHADER segfault on RADV/gfx1151
+        // Non-contiguous: GPU shader if flag enabled, otherwise CPU fallback
+        if shader_flags().copy_strided {
+            eprintln!("[WGPU-TRACE] copy_strided_src GPU shader for non-contiguous");
+            return self.copy_strided_src_internal(dst, dst_offset, src_l);
+        }
         eprintln!("[WGPU-TRACE] copy_strided_src CPU fallback for non-contiguous");
         let src_cpu = self.to_cpu_storage()?;
         let mut dst_cpu = dst.to_cpu_storage()?;
