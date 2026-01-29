@@ -229,7 +229,6 @@ impl WgpuStorage {
     /// A[b, 1, K] @ B[b, K, N] -> C[b, 1, N]
     /// Uses 256-thread workgroups with parallel reduction over K dimension.
     fn gemv_bf16_gpu(&self, rhs: &Self, b: usize, n: usize, k: usize) -> Result<Self> {
-        eprintln!("[WGPU-TRACE] GEMV BF16 b={b} n={n} k={k}");
         let total_output_size = b * n; // m=1, so output is b*n
         let total_output_f32_bytes = total_output_size * std::mem::size_of::<f32>();
 
