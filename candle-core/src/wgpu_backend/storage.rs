@@ -1708,9 +1708,27 @@ impl BackendStorage for WgpuStorage {
 
         // Non-contiguous BF16: make contiguous on GPU, then matmul
         if self.dtype == DType::BF16 && !is_contiguous {
-            let lhs_contiguous = self.make_contiguous_gpu(lhs_l)?;
-            let rhs_contiguous = rhs.make_contiguous_gpu(rhs_l)?;
-            return lhs_contiguous.matmul_bf16_gpu(&rhs_contiguous, b, m, n, k);
+            eprintln!("[WGPU-TRACE] matmul non-contiguous BF16: making contiguous on GPU");
+            eprintln!("[WGPU-TRACE]   lhs: shape={:?} strides={:?} offset={} contig={}", lhs_l.shape(), lhs_l.stride(), lhs_l.start_offset(), lhs_l.is_contiguous());
+            eprintln!("[WGPU-TRACE]   rhs: shape={:?} strides={:?} offset={} contig={}", rhs_l.shape(), rhs_l.stride(), rhs_l.start_offset(), rhs_l.is_contiguous());
+            eprintln!("[WGPU-TRACE]   lhs buffer count={} rhs buffer count={}", self.count, rhs.count);
+            let lhs_contiguous = if lhs_l.is_contiguous() {
+                self.clone()
+            } else {
+                eprintln!("[WGPU-TRACE]   making lhs contiguous...");
+                self.make_contiguous_gpu(lhs_l)?
+            };
+            let rhs_contiguous = if rhs_l.is_contiguous() {
+                rhs.clone()
+            } else {
+                eprintln!("[WGPU-TRACE]   making rhs contiguous...");
+                rhs.make_contiguous_gpu(rhs_l)?
+            };
+            eprintln!("[WGPU-TRACE]   calling matmul_bf16_gpu b={} m={} n={} k={}", b, m, n, k);
+            self.device.device().poll(wgpu::Maintain::Wait);
+            let result = lhs_contiguous.matmul_bf16_gpu(&rhs_contiguous, b, m, n, k)?;
+            eprintln!("[WGPU-TRACE]   matmul_bf16_gpu DONE");
+            return Ok(result);
         }
         self.from_cpu_binary_op(rhs, lhs_l, rhs_l, |lhs_cpu, rhs_cpu, ll, rl| {
             lhs_cpu.matmul(rhs_cpu, bmnk, ll, rl)
