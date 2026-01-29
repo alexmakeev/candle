@@ -168,8 +168,9 @@ impl WgpuStorage {
             "matmul_bf16_dims",
         );
 
-        let workgroups_x = (m as u32 + 15) / 16;
-        let workgroups_y = (n as u32 + 15) / 16;
+        // Tiled matmul: each workgroup covers BM=64 rows x BN=64 cols
+        let workgroups_x = (m as u32 + 63) / 64;
+        let workgroups_y = (n as u32 + 63) / 64;
         let workgroups_z = b as u32;
 
         self.device.with_pipeline(ShaderType::MatmulBF16, |cached| {

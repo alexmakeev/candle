@@ -467,18 +467,31 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
-/// WGSL shader for BF16 matrix multiplication
+/// WGSL shader for BF16 matrix multiplication (tiled with shared memory)
 /// BF16 stored as u16 (upper 16 bits of f32), converted to f32 for computation
 ///
 /// A[M, K] @ B[K, N] = C[M, N]
 /// Input: 2x BF16 packed per u32 (little-endian), row-major
-/// Output: F32 array (will be converted to BF16 on CPU for flexibility)
+/// Output: F32 array
+///
+/// Tiling: BM=64, BN=64, BK=16, TM=4, TN=4
+/// Workgroup: 16x16 = 256 threads
+/// Each thread computes a TM x TN = 4x4 block of output
+/// Shared memory: tile_a[BM][BK] + tile_b[BK][BN] = 64*16 + 16*64 = 2048 f32 = 8KB
 pub const MATMUL_BF16_SHADER: &str = r#"
-// Batched BF16 Matrix Multiplication
+// Tiled Batched BF16 Matrix Multiplication with Shared Memory
 // A[b, M, K] @ B[b, K, N] -> C[b, M, N]
 // Input: BF16 packed as u32 (2 BF16 per u32, little-endian, row-major)
 // Output: F32 array
-// Batch dimension via global_id.z
+// Batch dimension via workgroup_id.z
+
+const BM: u32 = 64u;
+const BN: u32 = 64u;
+const BK: u32 = 16u;
+const TM: u32 = 4u;
+const TN: u32 = 4u;
+// Workgroup: 16x16 = 256 threads
+// Each thread covers TM rows and TN cols -> 16*4=64=BM, 16*4=64=BN
 
 struct Dimensions {
     M: u32,
@@ -496,58 +509,155 @@ struct Dimensions {
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 @group(0) @binding(3) var<uniform> dims: Dimensions;
 
+// Shared memory tiles
+var<workgroup> tile_a: array<f32, 1024>;  // BM * BK = 64 * 16 = 1024
+var<workgroup> tile_b: array<f32, 1024>;  // BK * BN = 16 * 64 = 1024
+
 // Convert BF16 (16-bit) to F32
-// BF16 = upper 16 bits of f32, so just shift left 16
 fn bf16_to_f32(bits: u32) -> f32 {
     return bitcast<f32>(bits << 16u);
 }
 
 @compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let row = global_id.x;
-    let col = global_id.y;
-    let batch = global_id.z;
-
-    if (row >= dims.M || col >= dims.N || batch >= dims.batch_count) {
+fn main(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let batch = wg_id.z;
+    if (batch >= dims.batch_count) {
         return;
     }
 
+    // Tile position in output matrix
+    let tile_row = wg_id.x;  // which BM-tile row
+    let tile_col = wg_id.y;  // which BN-tile col
+
+    // Local thread position
+    let local_row = local_id.x;  // 0..15
+    let local_col = local_id.y;  // 0..15
+    let thread_idx = local_row * 16u + local_col;  // 0..255
+
+    // Batch offsets in element space
     let a_offset = batch * dims.a_batch_stride;
     let b_offset = batch * dims.b_batch_stride;
     let c_offset = batch * dims.c_batch_stride;
 
-    var sum: f32 = 0.0;
+    // Global row/col start for this tile
+    let row_start = tile_row * BM;
+    let col_start = tile_col * BN;
 
-    // Compute dot product for C[batch, row, col]
-    for (var kk: u32 = 0u; kk < dims.K; kk = kk + 1u) {
-        // Read A[batch, row, kk]
-        let a_idx = a_offset + row * dims.K + kk;
-        let a_packed_idx = a_idx / 2u;
-        let a_is_high = (a_idx % 2u) == 1u;
-        let a_packed = a[a_packed_idx];
-        let a_val = select(
-            bf16_to_f32(a_packed & 0xFFFFu),
-            bf16_to_f32(a_packed >> 16u),
-            a_is_high
-        );
-
-        // Read B[batch, kk, col]
-        let b_idx = b_offset + kk * dims.N + col;
-        let b_packed_idx = b_idx / 2u;
-        let b_is_high = (b_idx % 2u) == 1u;
-        let b_packed = b[b_packed_idx];
-        let b_val = select(
-            bf16_to_f32(b_packed & 0xFFFFu),
-            bf16_to_f32(b_packed >> 16u),
-            b_is_high
-        );
-
-        sum = sum + a_val * b_val;
+    // Accumulators: TM x TN = 4x4 per thread
+    var acc: array<f32, 16>;  // TM * TN = 16
+    for (var i: u32 = 0u; i < 16u; i++) {
+        acc[i] = 0.0;
     }
 
-    // Write F32 output
-    let c_idx = c_offset + row * dims.N + col;
-    c[c_idx] = sum;
+    // Number of K-tiles
+    let num_k_tiles = (dims.K + BK - 1u) / BK;
+
+    // Loop over K-tiles
+    for (var kt: u32 = 0u; kt < num_k_tiles; kt++) {
+        let k_start = kt * BK;
+
+        // === Cooperative load tile_a[BM][BK] ===
+        // 256 threads load 64*16 = 1024 elements -> 4 elements per thread
+        for (var i: u32 = 0u; i < 4u; i++) {
+            let flat_idx = thread_idx * 4u + i;
+            let tile_r = flat_idx / BK;  // row in tile (0..63)
+            let tile_k = flat_idx % BK;  // col in tile (0..15)
+            let global_r = row_start + tile_r;
+            let global_k = k_start + tile_k;
+
+            var val: f32 = 0.0;
+            if (global_r < dims.M && global_k < dims.K) {
+                let a_idx = a_offset + global_r * dims.K + global_k;
+                let packed = a[a_idx / 2u];
+                let bits = select(packed & 0xFFFFu, packed >> 16u, (a_idx % 2u) == 1u);
+                val = bf16_to_f32(bits);
+            }
+            tile_a[tile_r * BK + tile_k] = val;
+        }
+
+        // === Cooperative load tile_b[BK][BN] ===
+        // 256 threads load 16*64 = 1024 elements -> 4 elements per thread
+        for (var i: u32 = 0u; i < 4u; i++) {
+            let flat_idx = thread_idx * 4u + i;
+            let tile_k = flat_idx / BN;  // row in tile (0..15)
+            let tile_c = flat_idx % BN;  // col in tile (0..63)
+            let global_k = k_start + tile_k;
+            let global_c = col_start + tile_c;
+
+            var val: f32 = 0.0;
+            if (global_k < dims.K && global_c < dims.N) {
+                let b_idx = b_offset + global_k * dims.N + global_c;
+                let packed = b[b_idx / 2u];
+                let bits = select(packed & 0xFFFFu, packed >> 16u, (b_idx % 2u) == 1u);
+                val = bf16_to_f32(bits);
+            }
+            tile_b[tile_k * BN + tile_c] = val;
+        }
+
+        workgroupBarrier();
+
+        // === Compute TM x TN partial products from shared memory ===
+        // This thread is responsible for rows [local_row*TM .. local_row*TM+TM)
+        //                          and cols [local_col*TN .. local_col*TN+TN)
+        let my_row = local_row * TM;  // starting row within tile (0, 4, 8, ..., 60)
+        let my_col = local_col * TN;  // starting col within tile (0, 4, 8, ..., 60)
+
+        // Determine how many k-elements to process in this tile
+        let k_bound = min(BK, dims.K - k_start);
+
+        for (var kk: u32 = 0u; kk < k_bound; kk++) {
+            // Load TM values from tile_a column kk
+            let a0 = tile_a[(my_row + 0u) * BK + kk];
+            let a1 = tile_a[(my_row + 1u) * BK + kk];
+            let a2 = tile_a[(my_row + 2u) * BK + kk];
+            let a3 = tile_a[(my_row + 3u) * BK + kk];
+
+            // Load TN values from tile_b row kk
+            let b0 = tile_b[kk * BN + my_col + 0u];
+            let b1 = tile_b[kk * BN + my_col + 1u];
+            let b2 = tile_b[kk * BN + my_col + 2u];
+            let b3 = tile_b[kk * BN + my_col + 3u];
+
+            // Accumulate outer product
+            acc[0]  += a0 * b0;
+            acc[1]  += a0 * b1;
+            acc[2]  += a0 * b2;
+            acc[3]  += a0 * b3;
+            acc[4]  += a1 * b0;
+            acc[5]  += a1 * b1;
+            acc[6]  += a1 * b2;
+            acc[7]  += a1 * b3;
+            acc[8]  += a2 * b0;
+            acc[9]  += a2 * b1;
+            acc[10] += a2 * b2;
+            acc[11] += a2 * b3;
+            acc[12] += a3 * b0;
+            acc[13] += a3 * b1;
+            acc[14] += a3 * b2;
+            acc[15] += a3 * b3;
+        }
+
+        workgroupBarrier();
+    }
+
+    // === Write TM x TN output elements ===
+    for (var tr: u32 = 0u; tr < TM; tr++) {
+        let global_r = row_start + local_row * TM + tr;
+        if (global_r >= dims.M) {
+            continue;
+        }
+        for (var tc: u32 = 0u; tc < TN; tc++) {
+            let global_c = col_start + local_col * TN + tc;
+            if (global_c >= dims.N) {
+                continue;
+            }
+            let c_idx = c_offset + global_r * dims.N + global_c;
+            c[c_idx] = acc[tr * TN + tc];
+        }
+    }
 }
 "#;
 
