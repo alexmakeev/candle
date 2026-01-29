@@ -1,5 +1,14 @@
 # Ledger
 
+## 2026-01-30 03:00
+Done: Tested all 3 optimizations on Lyuda individually, merged GEMV shader. Results:
+- GEMV shader: 4.16-5.08 tok/s (+7-30% vs 3.90 baseline) — MERGED
+- Batch dispatch: 3.47 tok/s (-11%) — NOT merged, Mutex overhead + loss of GPU pipeline parallelism
+- Matmul tiling: 3.51 tok/s (-10%) — NOT merged, BM=64 tile wastes 63/64 rows for m=1 decode
+- Combined GEMV+batch: 3.22 tok/s — even worse together
+Key learning: wgpu/RADV benefits from frequent small submits (pipeline parallelism), not batched encoders. Bottleneck is shader execution, not submit overhead.
+Next: Profile what's actually slow in the shaders. Consider: fused ops, BF16-native output, subgroup operations for RDNA3.
+
 ## 2026-01-30 01:00
 Done: Implemented contiguous weight cache in Linear::new() (weight_t field) + fixed copy_strided 2D dispatch for large tensors (>65535 workgroups) + made k.transpose contiguous in attention. Result: 0.33 → 3.90 tok/s (12x), zero CPU fallback matmuls.
 Next: Further optimization — batch dispatches (700 submits/token), GEMV shader for m=1, matmul tiling with shared memory. Target: 50-100 tok/s.
