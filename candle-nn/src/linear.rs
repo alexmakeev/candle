@@ -32,7 +32,26 @@ impl Linear {
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
         // Pre-compute transposed contiguous weight for backends that need contiguous inputs
         // (notably wgpu). This is a one-time cost at model load vs per-forward-call overhead.
-        let weight_t = weight.t().ok().and_then(|wt| wt.contiguous().ok());
+        let weight_t = match weight.t() {
+            Ok(wt) => match wt.contiguous() {
+                Ok(wtc) => {
+                    eprintln!(
+                        "[LINEAR] weight_t cached: shape={:?} contiguous={}",
+                        wtc.dims(),
+                        wtc.is_contiguous()
+                    );
+                    Some(wtc)
+                }
+                Err(e) => {
+                    eprintln!("[LINEAR] weight_t contiguous FAILED: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("[LINEAR] weight.t() FAILED: {e}");
+                None
+            }
+        };
         Self { weight, bias, weight_t }
     }
 
