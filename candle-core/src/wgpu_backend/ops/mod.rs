@@ -551,6 +551,157 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
+/// Specialized GEMV (matrix-vector multiply) shader for m=1 BF16 matmul.
+/// A[b, 1, K] @ B[b, K, N] -> C[b, 1, N]
+/// Uses 256-thread workgroups with shared memory for the input vector.
+/// Each workgroup computes one output element via parallel reduction over K.
+/// Vectorized BF16 loads (4 values per vec2<u32> load).
+pub const GEMV_BF16_SHADER: &str = r#"
+// GEMV: A[b, 1, K] @ B[b, K, N] -> C[b, 1, N]
+// Specialized for m=1 case. Each workgroup computes ONE output element C[batch, 0, col].
+// 256 threads collaborate on the K-dimension reduction.
+// Input: BF16 packed as u32 (2 BF16 per u32, little-endian, row-major)
+// Output: F32 array
+
+struct Dimensions {
+    M: u32,
+    N: u32,
+    K: u32,
+    batch_count: u32,
+    a_batch_stride: u32,  // elements per batch in A (M*K = K for m=1)
+    b_batch_stride: u32,  // elements per batch in B (K*N)
+    c_batch_stride: u32,  // elements per batch in C (M*N = N for m=1)
+    _padding: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a: array<u32>;
+@group(0) @binding(1) var<storage, read> b: array<u32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> dims: Dimensions;
+
+const WG_SIZE: u32 = 256u;
+
+// Shared memory for partial sums — each thread stores its partial dot product
+var<workgroup> shared_partials: array<f32, 256>;
+
+fn bf16_to_f32(bits: u32) -> f32 {
+    return bitcast<f32>(bits << 16u);
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+) {
+    let tid = local_id.x;
+    let col = wg_id.x;       // output column index
+    let batch = wg_id.y;     // batch index
+
+    // Dispatch is exact (N workgroups in X, batch_count in Y),
+    // so col < N and batch < batch_count always hold.
+
+    let a_offset = batch * dims.a_batch_stride;
+    let b_offset = batch * dims.b_batch_stride;
+    let c_offset = batch * dims.c_batch_stride;
+
+    // Each thread accumulates partial dot product over its slice of K.
+    // Thread tid processes k indices: tid*4, (tid+WG_SIZE)*4, (tid+2*WG_SIZE)*4, ...
+    // Each iteration handles 4 consecutive BF16 elements (2 packed u32 reads for A).
+    var partial_sum: f32 = 0.0;
+
+    let num_vec4_chunks = dims.K / 4u;  // number of 4-element chunks in K
+
+    // Vectorized loop: each thread strides by WG_SIZE across vec4 chunks
+    var ki: u32 = tid;
+    loop {
+        if (ki >= num_vec4_chunks) {
+            break;
+        }
+        let k_base = ki * 4u;
+
+        // Load 4 consecutive BF16 values from A vector (2 packed u32)
+        // A is row-major [1, K], so elements are contiguous: a_offset + k_base
+        let a_packed_base = (a_offset + k_base) / 2u;
+        let a_packed0 = a[a_packed_base];
+        let a_packed1 = a[a_packed_base + 1u];
+        let a0 = bf16_to_f32(a_packed0 & 0xFFFFu);
+        let a1 = bf16_to_f32(a_packed0 >> 16u);
+        let a2 = bf16_to_f32(a_packed1 & 0xFFFFu);
+        let a3 = bf16_to_f32(a_packed1 >> 16u);
+
+        // Load B[k_base+i, col] for i=0..3.  B is row-major [K, N].
+        // b_idx = b_offset + (k_base+i) * N + col
+        let b_row_base = b_offset + k_base * dims.N + col;
+        let b_idx0 = b_row_base;
+        let b_idx1 = b_row_base + dims.N;
+        let b_idx2 = b_row_base + 2u * dims.N;
+        let b_idx3 = b_row_base + 3u * dims.N;
+
+        let b_packed0 = b[b_idx0 / 2u];
+        let b0 = select(bf16_to_f32(b_packed0 & 0xFFFFu), bf16_to_f32(b_packed0 >> 16u), (b_idx0 % 2u) == 1u);
+
+        let b_packed1 = b[b_idx1 / 2u];
+        let b1 = select(bf16_to_f32(b_packed1 & 0xFFFFu), bf16_to_f32(b_packed1 >> 16u), (b_idx1 % 2u) == 1u);
+
+        let b_packed2 = b[b_idx2 / 2u];
+        let b2 = select(bf16_to_f32(b_packed2 & 0xFFFFu), bf16_to_f32(b_packed2 >> 16u), (b_idx2 % 2u) == 1u);
+
+        let b_packed3 = b[b_idx3 / 2u];
+        let b3 = select(bf16_to_f32(b_packed3 & 0xFFFFu), bf16_to_f32(b_packed3 >> 16u), (b_idx3 % 2u) == 1u);
+
+        partial_sum = partial_sum + a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
+
+        ki = ki + WG_SIZE;
+    }
+
+    // Handle remaining elements (K not divisible by 4)
+    // Only threads with tid < remainder do work; others keep partial_sum as-is.
+    let remainder_start = num_vec4_chunks * 4u;
+    let k_remainder = dims.K - remainder_start;
+    if (tid < k_remainder) {
+        let kk = remainder_start + tid;
+        let a_elem_idx = a_offset + kk;
+        let a_packed = a[a_elem_idx / 2u];
+        let a_val = select(bf16_to_f32(a_packed & 0xFFFFu), bf16_to_f32(a_packed >> 16u), (a_elem_idx % 2u) == 1u);
+
+        let b_elem_idx = b_offset + kk * dims.N + col;
+        let b_packed = b[b_elem_idx / 2u];
+        let b_val = select(bf16_to_f32(b_packed & 0xFFFFu), bf16_to_f32(b_packed >> 16u), (b_elem_idx % 2u) == 1u);
+
+        partial_sum = partial_sum + a_val * b_val;
+    }
+
+    // Parallel reduction in shared memory.
+    // All 256 threads must participate in every barrier (WGSL requirement).
+    shared_partials[tid] = partial_sum;
+    workgroupBarrier();
+
+    // Tree reduction: 256 -> 128 -> 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
+    if (tid < 128u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 128u]; }
+    workgroupBarrier();
+    if (tid < 64u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 64u]; }
+    workgroupBarrier();
+    if (tid < 32u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 32u]; }
+    workgroupBarrier();
+    if (tid < 16u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 16u]; }
+    workgroupBarrier();
+    if (tid < 8u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 8u]; }
+    workgroupBarrier();
+    if (tid < 4u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 4u]; }
+    workgroupBarrier();
+    if (tid < 2u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 2u]; }
+    workgroupBarrier();
+    if (tid < 1u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 1u]; }
+    workgroupBarrier();
+
+    // Thread 0 writes the final dot product result
+    if (tid == 0u) {
+        let c_idx = c_offset + col;
+        c[c_idx] = shared_partials[0];
+    }
+}
+"#;
+
 /// BF16 binary operation shader (contiguous inputs only)
 /// Supports: Add(0), Sub(1), Mul(2), Div(3), Min(4), Max(5)
 /// Each thread handles 2 output elements (one packed u32)

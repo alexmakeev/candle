@@ -198,6 +198,111 @@ fn test_linear_matmul(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn test_gemv_bf16(device: &Device) -> Result<()> {
+    // Test 1: Simple GEMV — [1,4] @ [4,3] = [1,3]
+    let a = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 4), device)?.to_dtype(DType::BF16)?;
+    let b = Tensor::from_vec(
+        vec![1.0f32, 0.0, 0.0,
+             0.0, 1.0, 0.0,
+             0.0, 0.0, 1.0,
+             1.0, 1.0, 1.0],
+        (4, 3),
+        device,
+    )?.to_dtype(DType::BF16)?;
+    let c = a.matmul(&b)?.to_dtype(DType::F32)?;
+    let result: Vec<f32> = c.to_vec2::<f32>()?.into_iter().flatten().collect();
+    // [1,2,3,4] @ [[1,0,0],[0,1,0],[0,0,1],[1,1,1]] = [1+4, 2+4, 3+4] = [5, 6, 7]
+    let expected = vec![5.0, 6.0, 7.0];
+    for (i, (e, g)) in expected.iter().zip(result.iter()).enumerate() {
+        assert!((e - g).abs() < 0.5, "gemv_simple[{i}]: expected {e}, got {g}");
+    }
+
+    // Test 2: Larger K dimension — [1,128] @ [128,64] = [1,64]
+    let a_data: Vec<f32> = (0..128).map(|i| (i as f32) * 0.01).collect();
+    let b_data: Vec<f32> = (0..128*64).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+    let a = Tensor::from_vec(a_data.clone(), (1, 128), device)?.to_dtype(DType::BF16)?;
+    let b = Tensor::from_vec(b_data.clone(), (128, 64), device)?.to_dtype(DType::BF16)?;
+    let c = a.matmul(&b)?.to_dtype(DType::F32)?;
+    let result: Vec<f32> = c.to_vec2::<f32>()?.into_iter().flatten().collect();
+    // Verify against CPU reference
+    let a_cpu = Tensor::from_vec(a_data, (1, 128), &Device::Cpu)?.to_dtype(DType::BF16)?;
+    let b_cpu = Tensor::from_vec(b_data, (128, 64), &Device::Cpu)?.to_dtype(DType::BF16)?;
+    let c_cpu = a_cpu.matmul(&b_cpu)?.to_dtype(DType::F32)?;
+    let expected: Vec<f32> = c_cpu.to_vec2::<f32>()?.into_iter().flatten().collect();
+    for (i, (e, g)) in expected.iter().zip(result.iter()).enumerate() {
+        let tol = e.abs() * 0.05 + 0.1;
+        assert!((e - g).abs() < tol, "gemv_large[{i}]: expected {e}, got {g}");
+    }
+
+    // Test 3: Batched GEMV — [2, 1, 4] @ [2, 4, 3] = [2, 1, 3]
+    let a_batch = Tensor::from_vec(
+        vec![1.0f32, 2.0, 3.0, 4.0,
+             5.0, 6.0, 7.0, 8.0],
+        (2, 1, 4),
+        device,
+    )?.to_dtype(DType::BF16)?;
+    let b_batch = Tensor::from_vec(
+        vec![1.0f32, 0.0, 0.0,
+             0.0, 1.0, 0.0,
+             0.0, 0.0, 1.0,
+             0.0, 0.0, 0.0,
+             // batch 2
+             2.0, 0.0, 0.0,
+             0.0, 2.0, 0.0,
+             0.0, 0.0, 2.0,
+             0.0, 0.0, 0.0],
+        (2, 4, 3),
+        device,
+    )?.to_dtype(DType::BF16)?;
+    let c_batch = a_batch.matmul(&b_batch)?.to_dtype(DType::F32)?;
+    let result: Vec<f32> = c_batch.to_vec3::<f32>()?.into_iter().flatten().flatten().collect();
+    // batch 0: [1,2,3,4] @ [[1,0,0],[0,1,0],[0,0,1],[0,0,0]] = [1,2,3]
+    // batch 1: [5,6,7,8] @ [[2,0,0],[0,2,0],[0,0,2],[0,0,0]] = [10,12,14]
+    let expected = vec![1.0, 2.0, 3.0, 10.0, 12.0, 14.0];
+    for (i, (e, g)) in expected.iter().zip(result.iter()).enumerate() {
+        assert!((e - g).abs() < 0.5, "gemv_batch[{i}]: expected {e}, got {g}");
+    }
+
+    // Test 4: K=6 (even but not divisible by 4) — exercises GEMV remainder path
+    let a = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (1, 6), device)?.to_dtype(DType::BF16)?;
+    let b = Tensor::from_vec(
+        vec![1.0f32, 0.0, 0.0,
+             0.0, 1.0, 0.0,
+             0.0, 0.0, 1.0,
+             1.0, 1.0, 1.0,
+             2.0, 2.0, 2.0,
+             0.5, 0.5, 0.5],
+        (6, 3),
+        device,
+    )?.to_dtype(DType::BF16)?;
+    let c = a.matmul(&b)?.to_dtype(DType::F32)?;
+    let result: Vec<f32> = c.to_vec2::<f32>()?.into_iter().flatten().collect();
+    // [1,2,3,4,5,6] @ [[1,0,0],[0,1,0],[0,0,1],[1,1,1],[2,2,2],[0.5,0.5,0.5]]
+    // = [1+4+10+3, 2+4+10+3, 3+4+10+3] = [18, 19, 20]
+    let expected = vec![18.0, 19.0, 20.0];
+    for (i, (e, g)) in expected.iter().zip(result.iter()).enumerate() {
+        assert!((e - g).abs() < 0.5, "gemv_k6[{i}]: expected {e}, got {g}");
+    }
+
+    // Test 5: K=8 (divisible by 4, exactly 2 vec4 chunks, no remainder)
+    let a = Tensor::from_vec(vec![1.0f32; 8], (1, 8), device)?.to_dtype(DType::BF16)?;
+    let b_data: Vec<f32> = (0..8*4).map(|i| (i as f32) * 0.1).collect();
+    let b = Tensor::from_vec(b_data.clone(), (8, 4), device)?.to_dtype(DType::BF16)?;
+    let c = a.matmul(&b)?.to_dtype(DType::F32)?;
+    let result: Vec<f32> = c.to_vec2::<f32>()?.into_iter().flatten().collect();
+    let a_cpu = Tensor::from_vec(vec![1.0f32; 8], (1, 8), &Device::Cpu)?.to_dtype(DType::BF16)?;
+    let b_cpu = Tensor::from_vec(b_data, (8, 4), &Device::Cpu)?.to_dtype(DType::BF16)?;
+    let c_cpu = a_cpu.matmul(&b_cpu)?.to_dtype(DType::F32)?;
+    let expected: Vec<f32> = c_cpu.to_vec2::<f32>()?.into_iter().flatten().collect();
+    for (i, (e, g)) in expected.iter().zip(result.iter()).enumerate() {
+        let tol = e.abs() * 0.05 + 0.1;
+        assert!((e - g).abs() < tol, "gemv_k8[{i}]: expected {e}, got {g}");
+    }
+
+    eprintln!("[OK] gemv BF16 (simple, large K=128, batched, K=6 remainder, K=8 exact)");
+    Ok(())
+}
+
 fn test_copy_strided(device: &Device) -> Result<()> {
     let data = Tensor::from_vec(
         vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -236,6 +341,7 @@ fn main() {
         ("copy_strided_f32", Box::new(test_copy_strided_f32)),
         ("copy_strided", Box::new(test_copy_strided)),
         ("linear_matmul", Box::new(test_linear_matmul)),
+        ("gemv_bf16", Box::new(test_gemv_bf16)),
         ("odd_count", Box::new(test_odd_count)),
     ];
 

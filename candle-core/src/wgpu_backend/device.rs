@@ -47,6 +47,7 @@ pub enum ShaderType {
     RmsNormBF16,
     RopeBF16,
     IndexSelectBF16,
+    GemvBF16,
 }
 
 /// Unique identifier for a wgpu device
@@ -229,6 +230,7 @@ impl WgpuDevice {
             ShaderType::RmsNormBF16 => (ops::RMS_NORM_BF16_SHADER, "rms_norm_bf16"),
             ShaderType::RopeBF16 => (ops::ROPE_BF16_SHADER, "rope_bf16"),
             ShaderType::IndexSelectBF16 => (ops::INDEX_SELECT_BF16_SHADER, "index_select_bf16"),
+            ShaderType::GemvBF16 => (ops::GEMV_BF16_SHADER, "gemv_bf16"),
         };
 
         let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -261,7 +263,7 @@ impl WgpuDevice {
 
     fn create_bind_group_layout_for_shader(&self, shader_type: ShaderType, label: &str) -> wgpu::BindGroupLayout {
         match shader_type {
-            ShaderType::MatmulF32 | ShaderType::MatmulF16 | ShaderType::MatmulBF16 => {
+            ShaderType::MatmulF32 | ShaderType::MatmulF16 | ShaderType::MatmulBF16 | ShaderType::GemvBF16 => {
                 self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some(&format!("{}_bind_group_layout", label)),
                     entries: &[

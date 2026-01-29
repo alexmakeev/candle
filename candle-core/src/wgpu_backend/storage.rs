@@ -142,6 +142,12 @@ impl WgpuStorage {
     /// A[b, m, k] @ B[b, k, n] → C[b, m, n] in BF16.
     /// Internally accumulates in F32, batch dimension dispatched via global_id.z.
     fn matmul_bf16_gpu(&self, rhs: &Self, b: usize, m: usize, n: usize, k: usize) -> Result<Self> {
+        // Use specialized GEMV shader for m=1 (single row × full weight matrix)
+        // Requires K even (for aligned BF16 packed u32 reads in batched case)
+        if m == 1 && k % 2 == 0 {
+            return self.gemv_bf16_gpu(rhs, b, n, k);
+        }
+
         let total_output_size = b * m * n;
         let total_output_f32_bytes = total_output_size * std::mem::size_of::<f32>();
 
@@ -203,6 +209,90 @@ impl WgpuStorage {
             {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("matmul_bf16_pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&cached.pipeline);
+                compute_pass.set_bind_group(0, &bind_group, &[]);
+                compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, workgroups_z);
+            }
+
+            self.device.queue().submit(std::iter::once(encoder.finish()));
+        });
+
+        // Convert F32 output to BF16 on GPU (no CPU readback)
+        let bf16_output = self.cast_f32_to_bf16_gpu(&output_f32_buffer, total_output_size)?;
+
+        Ok(bf16_output)
+    }
+
+    /// Specialized GEMV for m=1 BF16 matmul.
+    /// A[b, 1, K] @ B[b, K, N] -> C[b, 1, N]
+    /// Uses 256-thread workgroups with parallel reduction over K dimension.
+    fn gemv_bf16_gpu(&self, rhs: &Self, b: usize, n: usize, k: usize) -> Result<Self> {
+        let total_output_size = b * n; // m=1, so output is b*n
+        let total_output_f32_bytes = total_output_size * std::mem::size_of::<f32>();
+
+        let output_f32_buffer = self.device.create_buffer(
+            total_output_f32_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "gemv_bf16_output_f32",
+        );
+
+        // Reuse same Dimensions struct (M=1)
+        let dims = MatmulBF16Dimensions {
+            m: 1,
+            n: n as u32,
+            k: k as u32,
+            batch_count: b as u32,
+            a_batch_stride: k as u32,       // 1*K
+            b_batch_stride: (k * n) as u32,
+            c_batch_stride: n as u32,       // 1*N
+            _padding: 0,
+        };
+        let dims_bytes = bytemuck::bytes_of(&dims);
+        let dims_buffer = self.device.create_buffer_init(
+            dims_bytes,
+            wgpu::BufferUsages::UNIFORM,
+            "gemv_bf16_dims",
+        );
+
+        // One workgroup per output element (col, batch)
+        // workgroup_id.x = output column, workgroup_id.y = batch
+        let workgroups_x = n as u32;
+        let workgroups_y = b as u32;
+        let workgroups_z = 1u32;
+
+        self.device.with_pipeline(ShaderType::GemvBF16, |cached| {
+            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gemv_bf16_bind_group"),
+                layout: &cached.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rhs.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_f32_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: dims_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gemv_bf16_encoder"),
+            });
+
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gemv_bf16_pass"),
                     timestamp_writes: None,
                 });
                 compute_pass.set_pipeline(&cached.pipeline);
