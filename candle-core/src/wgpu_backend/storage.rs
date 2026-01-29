@@ -1744,101 +1744,14 @@ impl BackendStorage for WgpuStorage {
             return Ok(());
         }
 
-        // Non-contiguous: use strided copy shader
-        let elem_count = src_l.shape().elem_count();
-        if elem_count == 0 {
-            return Ok(());
-        }
-
-        let dims = src_l.dims();
-        let strides = src_l.stride();
-        let ndims = dims.len();
-        if ndims > 6 {
-            return Err(crate::Error::Msg(
-                "copy_strided_src: more than 6 dimensions not supported on wgpu".to_string(),
-            ));
-        }
-
-        let mut shape_arr = [1u32; 6];
-        let mut stride_arr = [0u32; 6];
-        for i in 0..ndims {
-            shape_arr[i] = dims[i] as u32;
-            stride_arr[i] = strides[i] as u32;
-        }
-
-        let params = CopyStridedParams {
-            ndims: ndims as u32,
-            src_offset: src_l.start_offset() as u32,
-            dst_offset: dst_offset as u32,
-            elem_count: elem_count as u32,
-            shape: shape_arr,
-            strides: stride_arr,
-        };
-        let params_buffer = self.device.create_buffer_init(
-            bytemuck::bytes_of(&params),
-            wgpu::BufferUsages::UNIFORM,
-            "copy_strided_params",
-        );
-
-        let shader_type = match self.dtype {
-            DType::BF16 => ShaderType::CopyStridedBF16,
-            DType::F32 => ShaderType::CopyStridedF32,
-            _ => {
-                // Fallback to CPU for unsupported dtypes
-                let src_cpu = self.to_cpu_storage()?;
-                let mut dst_cpu = dst.to_cpu_storage()?;
-                src_cpu.copy_strided_src(&mut dst_cpu, dst_offset, src_l)?;
-                let new_storage = BackendDevice::storage_from_cpu_storage(&self.device, &dst_cpu)?;
-                *dst = new_storage;
-                return Ok(());
-            }
-        };
-
-        let workgroups = match self.dtype {
-            DType::BF16 => {
-                let num_pairs = (elem_count + 1) / 2;
-                ((num_pairs as u32) + 255) / 256
-            }
-            _ => ((elem_count as u32) + 255) / 256,
-        };
-
-        self.device.with_pipeline(shader_type, |cached| {
-            let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("copy_strided_bind_group"),
-                layout: &cached.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: dst.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("copy_strided_encoder"),
-            });
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("copy_strided_pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&cached.pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
-        });
-
+        // Non-contiguous: CPU fallback for now
+        // TODO: debug COPY_STRIDED_BF16_SHADER segfault on RADV/gfx1151
+        eprintln!("[WGPU-TRACE] copy_strided_src CPU fallback for non-contiguous");
+        let src_cpu = self.to_cpu_storage()?;
+        let mut dst_cpu = dst.to_cpu_storage()?;
+        src_cpu.copy_strided_src(&mut dst_cpu, dst_offset, src_l)?;
+        let new_storage = BackendDevice::storage_from_cpu_storage(&self.device, &dst_cpu)?;
+        *dst = new_storage;
         Ok(())
     }
 
