@@ -592,13 +592,16 @@ fn bf16_to_f32(bits: u32) -> f32 {
 fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
 ) {
     let tid = local_id.x;
-    let col = wg_id.x;       // output column index
-    let batch = wg_id.y;     // batch index
+    let col = wg_id.x + wg_id.y * num_wg.x;  // 2D linearization for large N (>65535)
+    let batch = wg_id.z;                       // batch in z dimension
 
-    // Dispatch is exact (N workgroups in X, batch_count in Y),
-    // so col < N and batch < batch_count always hold.
+    // Guard: col may exceed N when grid is padded for 2D dispatch
+    if (col >= dims.N) {
+        return;
+    }
 
     let a_offset = batch * dims.a_batch_stride;
     let b_offset = batch * dims.b_batch_stride;

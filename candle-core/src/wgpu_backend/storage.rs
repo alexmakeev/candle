@@ -256,11 +256,11 @@ impl WgpuStorage {
             "gemv_bf16_dims",
         );
 
-        // One workgroup per output element (col, batch)
-        // workgroup_id.x = output column, workgroup_id.y = batch
-        let workgroups_x = n as u32;
-        let workgroups_y = b as u32;
-        let workgroups_z = 1u32;
+        // 2D dispatch for large N (>65535): linearize col = wg_id.x + wg_id.y * num_wg.x
+        let total_cols = n as u32;
+        let workgroups_x = total_cols.min(65535);
+        let workgroups_y = (total_cols + workgroups_x - 1) / workgroups_x;
+        let workgroups_z = b as u32;
 
         self.device.with_pipeline(ShaderType::GemvBF16, |cached| {
             let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
