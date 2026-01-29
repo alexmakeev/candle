@@ -1,6 +1,6 @@
 //! wgpu storage implementation
 
-use super::device::{ShaderType, WgpuDevice};
+use super::device::{buffer_size_bytes, ShaderType, WgpuDevice};
 use super::error::WgpuError;
 use super::flags::shader_flags;
 use crate::backend::{BackendDevice, BackendStorage};
@@ -77,9 +77,8 @@ impl WgpuStorage {
 
     fn to_cpu<T: bytemuck::Pod>(&self) -> Result<Vec<T>> {
         let size = self.count * std::mem::size_of::<T>();
-        // wgpu requires COPY_BUFFER_ALIGNMENT (4 bytes) for buffer copies
-        const COPY_ALIGNMENT: u64 = wgpu::COPY_BUFFER_ALIGNMENT;
-        let aligned_size = ((size as u64 + COPY_ALIGNMENT - 1) / COPY_ALIGNMENT) * COPY_ALIGNMENT;
+        // Use buffer's actual size for copy (already u32-aligned via buffer_size_bytes)
+        let aligned_size = self.buffer.size();
 
         let staging_buffer = self.device.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging_readback"),
@@ -237,7 +236,7 @@ impl WgpuStorage {
         })?;
         let num_rows = shape.elem_count() / hidden_size;
 
-        let output_bytes = shape.elem_count() * 2; // BF16
+        let output_bytes = buffer_size_bytes(shape.elem_count(), DType::BF16);
         let output_buffer = self.device.create_buffer(
             output_bytes as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
@@ -507,7 +506,7 @@ impl WgpuStorage {
     /// BF16 affine on GPU: y = x * mul + add. Input must be contiguous.
     fn affine_bf16_gpu(&self, layout: &Layout, mul_val: f32, add_val: f32) -> Result<Self> {
         let elem_count = layout.shape().elem_count();
-        let output_bytes = elem_count * 2;
+        let output_bytes = buffer_size_bytes(elem_count, DType::BF16);
 
         let output_buffer = self.device.create_buffer(
             output_bytes as u64,
@@ -587,7 +586,7 @@ impl WgpuStorage {
     /// BF16 unary op on GPU. Input must be contiguous.
     fn unary_bf16_gpu(&self, layout: &Layout, op_type: u32) -> Result<Self> {
         let elem_count = layout.shape().elem_count();
-        let output_bytes = elem_count * 2;
+        let output_bytes = buffer_size_bytes(elem_count, DType::BF16);
 
         let output_buffer = self.device.create_buffer(
             output_bytes as u64,
@@ -667,7 +666,7 @@ impl WgpuStorage {
     /// BF16 binary op on GPU. Both inputs must be contiguous.
     fn binary_bf16_gpu(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout, op_type: u32) -> Result<Self> {
         let elem_count = lhs_l.shape().elem_count();
-        let output_bytes = elem_count * 2; // BF16 = 2 bytes per element
+        let output_bytes = buffer_size_bytes(elem_count, DType::BF16);
 
         let output_buffer = self.device.create_buffer(
             output_bytes as u64,
@@ -751,8 +750,7 @@ impl WgpuStorage {
     /// Cast F32 buffer to BF16 on GPU. No CPU readback.
     /// Returns WgpuStorage with DType::BF16 and `elem_count` elements.
     fn cast_f32_to_bf16_gpu(&self, f32_buffer: &wgpu::Buffer, elem_count: usize) -> Result<Self> {
-        // BF16 output: ceil(elem_count/2) u32s → elem_count * 2 bytes
-        let bf16_bytes = elem_count * 2;
+        let bf16_bytes = buffer_size_bytes(elem_count, DType::BF16);
         let output_buffer = self.device.create_buffer(
             bf16_bytes as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
@@ -985,7 +983,7 @@ impl WgpuStorage {
         };
         let num_indices = ids_layout.shape().elem_count();
         let output_elem_count = num_indices * row_size;
-        let output_bytes = output_elem_count * 2; // BF16
+        let output_bytes = buffer_size_bytes(output_elem_count, DType::BF16);
 
         let output_buffer = self.device.create_buffer(
             output_bytes as u64,

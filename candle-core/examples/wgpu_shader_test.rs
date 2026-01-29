@@ -138,6 +138,28 @@ fn test_copy_strided_f32(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn test_odd_count(device: &Device) -> Result<()> {
+    // Test BF16 with odd element count (padding to u32 boundary)
+    let data = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0], (5,), device)?
+        .to_dtype(DType::BF16)?;
+    let result: Vec<f32> = data.to_dtype(DType::F32)?.to_vec1()?;
+    let expected = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+    for (i, (e, g)) in expected.iter().zip(result.iter()).enumerate() {
+        assert!((e - g).abs() < 0.1, "odd_count[{i}]: expected {e}, got {g}");
+    }
+
+    // Matmul with odd K dimension
+    let a = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 3), device)?.to_dtype(DType::BF16)?;
+    let b = Tensor::from_vec(vec![4.0f32, 5.0, 6.0], (3, 1), device)?.to_dtype(DType::BF16)?;
+    let c = a.matmul(&b)?.to_dtype(DType::F32)?;
+    let result: Vec<f32> = c.to_vec2::<f32>()?.into_iter().flatten().collect();
+    // 1*4 + 2*5 + 3*6 = 32
+    assert!((result[0] - 32.0).abs() < 1.0, "odd_matmul: expected 32, got {}", result[0]);
+
+    eprintln!("[OK] odd element count BF16");
+    Ok(())
+}
+
 fn test_copy_strided(device: &Device) -> Result<()> {
     let data = Tensor::from_vec(
         vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -175,6 +197,7 @@ fn main() {
         ("affine", Box::new(test_affine)),
         ("copy_strided_f32", Box::new(test_copy_strided_f32)),
         ("copy_strided", Box::new(test_copy_strided)),
+        ("odd_count", Box::new(test_odd_count)),
     ];
 
     let mut passed = 0;

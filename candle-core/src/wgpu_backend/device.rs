@@ -485,6 +485,16 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// Calculate buffer size in bytes for a given element count and dtype.
+/// BF16/F16 are stored as packed u32 (2 elements per u32), so buffer size
+/// must be rounded up to 4-byte boundary for odd element counts.
+pub fn buffer_size_bytes(elem_count: usize, dtype: DType) -> usize {
+    match dtype {
+        DType::BF16 | DType::F16 => ((elem_count + 1) / 2) * 4,
+        _ => elem_count * dtype.size_in_bytes(),
+    }
+}
+
 impl BackendDevice for WgpuDevice {
     type Storage = WgpuStorage;
 
@@ -502,7 +512,7 @@ impl BackendDevice for WgpuDevice {
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
         let elem_count = shape.elem_count();
-        let size_in_bytes = elem_count * dtype.size_in_bytes();
+        let size_in_bytes = buffer_size_bytes(elem_count, dtype);
 
         let buffer = self.create_buffer(
             size_in_bytes as u64,
@@ -523,7 +533,7 @@ impl BackendDevice for WgpuDevice {
 
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
         let elem_count = shape.elem_count();
-        let size_in_bytes = elem_count * dtype.size_in_bytes();
+        let size_in_bytes = buffer_size_bytes(elem_count, dtype);
 
         let buffer = self.create_buffer(
             size_in_bytes as u64,
@@ -547,8 +557,18 @@ impl BackendDevice for WgpuDevice {
             )
         };
 
+        // Pad to u32 boundary for BF16/F16 with odd element count
+        let padded_size = buffer_size_bytes(data.len(), T::DTYPE);
+        let actual_bytes = if padded_size > bytes.len() {
+            let mut padded = bytes.to_vec();
+            padded.resize(padded_size, 0);
+            padded
+        } else {
+            bytes.to_vec()
+        };
+
         let buffer = self.create_buffer_init(
-            bytes,
+            &actual_bytes,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             "from_slice",
         );
@@ -564,8 +584,18 @@ impl BackendDevice for WgpuDevice {
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
         let (bytes, dtype, len) = cpu_storage_to_bytes(storage);
 
+        // BF16/F16: pad to u32 boundary if odd element count
+        let padded_size = buffer_size_bytes(len, dtype);
+        let actual_bytes = if padded_size > bytes.len() {
+            let mut padded = bytes.to_vec();
+            padded.resize(padded_size, 0);
+            padded
+        } else {
+            bytes.to_vec()
+        };
+
         let buffer = self.create_buffer_init(
-            bytes,
+            &actual_bytes,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             "from_cpu",
         );
