@@ -404,11 +404,7 @@ impl Q8_0MatMul {
                 ],
             });
 
-            let mut encoder = device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("q8_0_matmul_encoder"),
-            });
-
-            {
+            device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("q8_0_matmul_pass"),
                     timestamp_writes: None,
@@ -419,9 +415,7 @@ impl Q8_0MatMul {
 
                 let workgroups = (self.num_rows as u32 + 63) / 64;
                 pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         // Read back results
@@ -432,11 +426,10 @@ impl Q8_0MatMul {
             mapped_at_creation: false,
         });
 
-        let mut encoder = device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("q8_0_readback_encoder"),
+        device.with_encoder(|encoder| {
+            encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size as u64);
         });
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size as u64);
-        device.queue().submit(std::iter::once(encoder.finish()));
+        device.flush();
 
         let buffer_slice = staging_buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();

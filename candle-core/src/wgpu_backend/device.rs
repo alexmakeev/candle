@@ -8,8 +8,9 @@ use crate::backend::BackendDevice;
 use crate::{CpuStorage, DType, DeviceLocation, Result, Shape};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use wgpu::{Adapter, Device, Instance, Queue};
+use wgpu::{Adapter, CommandEncoder, Device, Instance, Queue};
 
 /// Cached compute pipeline with its bind group layout
 #[derive(Debug)]
@@ -60,7 +61,6 @@ impl DeviceId {
 }
 
 /// A wgpu device for GPU compute operations
-#[derive(Debug)]
 pub struct WgpuDevice {
     id: DeviceId,
     device: Arc<Device>,
@@ -68,6 +68,27 @@ pub struct WgpuDevice {
     adapter: Arc<Adapter>,
     seed: Mutex<u64>,
     pipeline_cache: Arc<Mutex<HashMap<ShaderType, CachedPipeline>>>,
+    /// Shared command encoder for batching GPU dispatches.
+    /// All compute passes and buffer copies append to this encoder.
+    /// Flushed only when CPU readback is needed or explicitly requested.
+    shared_encoder: Arc<Mutex<Option<CommandEncoder>>>,
+    /// Counter tracking number of dispatches in the current encoder batch.
+    dispatch_count: Arc<AtomicUsize>,
+    /// Counter tracking total number of flush (submit) calls for profiling.
+    submit_count: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for WgpuDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WgpuDevice")
+            .field("id", &self.id)
+            .field("device", &self.device)
+            .field("queue", &self.queue)
+            .field("adapter", &self.adapter)
+            .field("dispatch_count", &self.dispatch_count.load(Ordering::Relaxed))
+            .field("submit_count", &self.submit_count.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl Clone for WgpuDevice {
@@ -79,6 +100,9 @@ impl Clone for WgpuDevice {
             adapter: Arc::clone(&self.adapter),
             seed: Mutex::new(*self.seed.lock()),
             pipeline_cache: Arc::clone(&self.pipeline_cache),
+            shared_encoder: Arc::clone(&self.shared_encoder),
+            dispatch_count: Arc::clone(&self.dispatch_count),
+            submit_count: Arc::clone(&self.submit_count),
         }
     }
 }
@@ -150,6 +174,9 @@ impl WgpuDevice {
             adapter,
             seed: Mutex::new(299792458),
             pipeline_cache: Arc::new(Mutex::new(HashMap::new())),
+            shared_encoder: Arc::new(Mutex::new(None)),
+            dispatch_count: Arc::new(AtomicUsize::new(0)),
+            submit_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -199,6 +226,51 @@ impl WgpuDevice {
         }
 
         f(cache.get(&shader_type).unwrap())
+    }
+
+    /// Access the shared command encoder, creating one if needed.
+    /// The closure receives a mutable reference to the encoder to record commands.
+    /// The encoder is NOT submitted — call flush() when GPU results are needed on CPU.
+    pub fn with_encoder<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut CommandEncoder) -> R,
+    {
+        let mut guard = self.shared_encoder.lock();
+        if guard.is_none() {
+            *guard = Some(self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("batched_encoder"),
+            }));
+        }
+        let encoder = guard.as_mut().unwrap();
+        let result = f(encoder);
+        self.dispatch_count.fetch_add(1, Ordering::Relaxed);
+        result
+    }
+
+    /// Flush the shared encoder: submit all recorded commands to the GPU queue.
+    /// Must be called before any CPU readback (to_cpu, map_async).
+    /// No-op if no commands have been recorded.
+    pub fn flush(&self) {
+        let mut guard = self.shared_encoder.lock();
+        if let Some(encoder) = guard.take() {
+            let dispatches = self.dispatch_count.swap(0, Ordering::Relaxed);
+            let submit_id = self.submit_count.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "[WGPU-BATCH] flush #{}: submitting {} dispatches",
+                submit_id, dispatches
+            );
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+    }
+
+    /// Get the total number of submit (flush) calls made so far. For profiling.
+    pub fn submit_count(&self) -> usize {
+        self.submit_count.load(Ordering::Relaxed)
+    }
+
+    /// Reset the submit counter. For profiling.
+    pub fn reset_submit_count(&self) {
+        self.submit_count.store(0, Ordering::Relaxed);
     }
 
     fn compile_pipeline(&self, shader_type: ShaderType) -> CachedPipeline {
@@ -634,6 +706,7 @@ impl BackendDevice for WgpuDevice {
     }
 
     fn synchronize(&self) -> Result<()> {
+        self.flush();
         self.device.poll(wgpu::Maintain::Wait);
         Ok(())
     }

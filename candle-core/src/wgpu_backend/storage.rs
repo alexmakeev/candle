@@ -87,11 +87,12 @@ impl WgpuStorage {
             mapped_at_creation: false,
         });
 
-        let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("readback_encoder"),
+        // Append the copy command to the shared encoder, then flush everything
+        // so the GPU finishes all prior compute + this copy before we map.
+        self.device.with_encoder(|encoder| {
+            encoder.copy_buffer_to_buffer(&self.buffer, 0, &staging_buffer, 0, aligned_size);
         });
-        encoder.copy_buffer_to_buffer(&self.buffer, 0, &staging_buffer, 0, aligned_size);
-        self.device.queue().submit(std::iter::once(encoder.finish()));
+        self.device.flush();
 
         let buffer_slice = staging_buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -196,11 +197,7 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("matmul_bf16_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("matmul_bf16_pass"),
                     timestamp_writes: None,
@@ -208,9 +205,7 @@ impl WgpuStorage {
                 compute_pass.set_pipeline(&cached.pipeline);
                 compute_pass.set_bind_group(0, &bind_group, &[]);
                 compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, workgroups_z);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         // Convert F32 output to BF16 on GPU (no CPU readback)
@@ -288,22 +283,15 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rms_norm_bf16_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("rms_norm_bf16_pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
-                // One workgroup per row
                 pass.dispatch_workgroups(num_rows as u32, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(WgpuStorage::new(
@@ -370,22 +358,15 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("softmax_bf16_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("softmax_bf16_pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
-                // One workgroup per row
                 pass.dispatch_workgroups(num_rows as u32, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         // Cast F32 output back to BF16 on GPU
@@ -482,11 +463,7 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rope_bf16_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("rope_bf16_pass"),
                     timestamp_writes: None,
@@ -494,9 +471,7 @@ impl WgpuStorage {
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         // Cast F32 → BF16 on GPU
@@ -558,11 +533,7 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("affine_bf16_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("affine_bf16_pass"),
                     timestamp_writes: None,
@@ -570,9 +541,7 @@ impl WgpuStorage {
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(WgpuStorage::new(
@@ -638,11 +607,7 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("unary_bf16_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("unary_bf16_pass"),
                     timestamp_writes: None,
@@ -650,9 +615,7 @@ impl WgpuStorage {
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(WgpuStorage::new(
@@ -722,11 +685,7 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("binary_bf16_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("binary_bf16_pass"),
                     timestamp_writes: None,
@@ -734,9 +693,7 @@ impl WgpuStorage {
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(WgpuStorage::new(
@@ -796,11 +753,7 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cast_f32_to_bf16_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cast_f32_to_bf16_pass"),
                     timestamp_writes: None,
@@ -808,9 +761,7 @@ impl WgpuStorage {
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(WgpuStorage::new(
@@ -867,11 +818,7 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cast_bf16_to_f32_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cast_bf16_to_f32_pass"),
                     timestamp_writes: None,
@@ -879,9 +826,7 @@ impl WgpuStorage {
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(WgpuStorage::new(
@@ -946,22 +891,15 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("reduce_f32_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("reduce_f32_pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
-                // One workgroup per row
                 pass.dispatch_workgroups(num_rows as u32, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(output_buffer)
@@ -1040,11 +978,7 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("index_select_bf16_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("index_select_bf16_pass"),
                     timestamp_writes: None,
@@ -1052,9 +986,7 @@ impl WgpuStorage {
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(WgpuStorage::new(
@@ -1103,11 +1035,9 @@ impl WgpuStorage {
             let dst_byte_offset = (dst_offset * elem_size) as u64;
             let copy_size = (src_l.shape().elem_count() * elem_size) as u64;
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("copy_contiguous_internal_encoder"),
+            self.device.with_encoder(|encoder| {
+                encoder.copy_buffer_to_buffer(&self.buffer, src_byte_offset, &dst.buffer, dst_byte_offset, copy_size);
             });
-            encoder.copy_buffer_to_buffer(&self.buffer, src_byte_offset, &dst.buffer, dst_byte_offset, copy_size);
-            self.device.queue().submit(std::iter::once(encoder.finish()));
             return Ok(());
         }
 
@@ -1182,11 +1112,7 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("copy_strided_internal_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("copy_strided_internal_pass"),
                     timestamp_writes: None,
@@ -1194,9 +1120,7 @@ impl WgpuStorage {
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(wg_x, wg_y, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(())
@@ -1249,11 +1173,7 @@ impl WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("matmul_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("matmul_pass"),
                     timestamp_writes: None,
@@ -1265,9 +1185,7 @@ impl WgpuStorage {
                 let workgroups_x = (m as u32 + 15) / 16;
                 let workgroups_y = (n as u32 + 15) / 16;
                 compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(WgpuStorage::new(
@@ -1732,11 +1650,9 @@ impl BackendStorage for WgpuStorage {
             let dst_byte_offset = (dst_offset * elem_size) as u64;
             let copy_size = (src_l.shape().elem_count() * elem_size) as u64;
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("copy_contiguous_encoder"),
+            self.device.with_encoder(|encoder| {
+                encoder.copy_buffer_to_buffer(&self.buffer, src_byte_offset, &dst.buffer, dst_byte_offset, copy_size);
             });
-            encoder.copy_buffer_to_buffer(&self.buffer, src_byte_offset, &dst.buffer, dst_byte_offset, copy_size);
-            self.device.queue().submit(std::iter::once(encoder.finish()));
             return Ok(());
         }
 
@@ -1773,11 +1689,9 @@ impl BackendStorage for WgpuStorage {
             let dst_byte_offset = (dst_o * elem_size) as u64;
             let copy_size = (total_elems * elem_size) as u64;
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("copy2d_contiguous_encoder"),
+            self.device.with_encoder(|encoder| {
+                encoder.copy_buffer_to_buffer(&self.buffer, src_byte_offset, &dst.buffer, dst_byte_offset, copy_size);
             });
-            encoder.copy_buffer_to_buffer(&self.buffer, src_byte_offset, &dst.buffer, dst_byte_offset, copy_size);
-            self.device.queue().submit(std::iter::once(encoder.finish()));
             return Ok(());
         }
 
@@ -1841,11 +1755,7 @@ impl BackendStorage for WgpuStorage {
                 ],
             });
 
-            let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("copy2d_strided_encoder"),
-            });
-
-            {
+            self.device.with_encoder(|encoder| {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("copy2d_strided_pass"),
                     timestamp_writes: None,
@@ -1853,9 +1763,7 @@ impl BackendStorage for WgpuStorage {
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(wg_x, wg_y, 1);
-            }
-
-            self.device.queue().submit(std::iter::once(encoder.finish()));
+            });
         });
 
         Ok(())
