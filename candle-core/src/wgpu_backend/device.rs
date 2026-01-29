@@ -11,6 +11,163 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use wgpu::{Adapter, Device, Instance, Queue};
 
+/// GPU buffer pool that reuses buffers to avoid per-operation Vulkan allocations.
+///
+/// Organizes free buffers by size bucket (next power of 2). Only pools STORAGE-class
+/// buffers with STORAGE | COPY_SRC | COPY_DST usage flags. Uniform and staging
+/// buffers are not pooled (small, different usage patterns).
+pub struct BufferPool {
+    /// Map from size_bucket -> Vec of free buffers ready for reuse
+    free_buffers: HashMap<u64, Vec<wgpu::Buffer>>,
+    /// Total number of pool hits (buffer reused)
+    hits: u64,
+    /// Total number of pool misses (new buffer allocated)
+    misses: u64,
+}
+
+impl std::fmt::Debug for BufferPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_free: usize = self.free_buffers.values().map(|v| v.len()).sum();
+        f.debug_struct("BufferPool")
+            .field("buckets", &self.free_buffers.len())
+            .field("total_free", &total_free)
+            .field("hits", &self.hits)
+            .field("misses", &self.misses)
+            .finish()
+    }
+}
+
+/// The standard usage flags for pooled storage buffers.
+const POOLED_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+    .union(wgpu::BufferUsages::COPY_SRC)
+    .union(wgpu::BufferUsages::COPY_DST);
+
+impl BufferPool {
+    fn new() -> Self {
+        Self {
+            free_buffers: HashMap::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Acquire a buffer of at least `size` bytes with STORAGE | COPY_SRC | COPY_DST usage.
+    /// Returns a buffer from the pool if available, otherwise allocates a new one.
+    /// The returned buffer may be larger than requested (rounded up to size bucket).
+    fn acquire(&mut self, size: u64, device: &wgpu::Device) -> wgpu::Buffer {
+        let bucket = Self::size_bucket(size);
+
+        if let Some(buffers) = self.free_buffers.get_mut(&bucket) {
+            if let Some(buf) = buffers.pop() {
+                self.hits += 1;
+                if (self.hits + self.misses) % 1000 == 0 {
+                    self.print_stats();
+                }
+                return buf;
+            }
+        }
+
+        self.misses += 1;
+        if (self.hits + self.misses) % 1000 == 0 {
+            self.print_stats();
+        }
+
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pooled_storage"),
+            size: bucket,
+            usage: POOLED_USAGE,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Return a buffer to the pool for future reuse.
+    /// The buffer must have been acquired from this pool (STORAGE usage flags).
+    fn release(&mut self, buffer: wgpu::Buffer) {
+        let bucket = Self::size_bucket(buffer.size());
+        self.free_buffers.entry(bucket).or_default().push(buffer);
+    }
+
+    /// Round up to next power of 2, minimum 256 bytes.
+    fn size_bucket(size: u64) -> u64 {
+        let min_size = 256u64;
+        let size = size.max(min_size);
+        size.next_power_of_two()
+    }
+
+    fn print_stats(&self) {
+        let total = self.hits + self.misses;
+        let hit_rate = if total > 0 {
+            (self.hits as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let total_free: usize = self.free_buffers.values().map(|v| v.len()).sum();
+        let total_free_bytes: u64 = self.free_buffers
+            .iter()
+            .map(|(bucket, bufs)| bucket * bufs.len() as u64)
+            .sum();
+        eprintln!(
+            "[BUFPOOL] hits={} misses={} rate={:.1}% free_bufs={} free_bytes={:.1}MB buckets={}",
+            self.hits,
+            self.misses,
+            hit_rate,
+            total_free,
+            total_free_bytes as f64 / 1048576.0,
+            self.free_buffers.len(),
+        );
+    }
+}
+
+/// A GPU buffer that returns itself to the BufferPool when dropped.
+/// Only buffers that were allocated from the pool (bucket-rounded sizes)
+/// are returned; other buffers are dropped normally.
+pub struct PooledBuffer {
+    buffer: Option<wgpu::Buffer>,
+    pool: Arc<Mutex<BufferPool>>,
+    /// Whether this buffer was allocated from/through the pool (bucket-rounded size).
+    /// Only pooled buffers are returned on drop.
+    from_pool: bool,
+}
+
+impl PooledBuffer {
+    /// Create a pooled buffer wrapper. If `from_pool` is true, the buffer will be
+    /// returned to the pool on drop.
+    pub fn new(buffer: wgpu::Buffer, pool: Arc<Mutex<BufferPool>>, from_pool: bool) -> Self {
+        Self {
+            buffer: Some(buffer),
+            pool,
+            from_pool,
+        }
+    }
+}
+
+impl std::ops::Deref for PooledBuffer {
+    type Target = wgpu::Buffer;
+
+    fn deref(&self) -> &wgpu::Buffer {
+        self.buffer.as_ref().expect("PooledBuffer already dropped")
+    }
+}
+
+impl std::fmt::Debug for PooledBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PooledBuffer")
+            .field("buffer", &self.buffer)
+            .finish()
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            if self.from_pool {
+                self.pool.lock().release(buffer);
+            }
+            // Otherwise buffer is dropped and deallocated by wgpu
+        }
+    }
+}
+
 /// Cached compute pipeline with its bind group layout
 #[derive(Debug)]
 pub struct CachedPipeline {
@@ -69,6 +226,7 @@ pub struct WgpuDevice {
     adapter: Arc<Adapter>,
     seed: Mutex<u64>,
     pipeline_cache: Arc<Mutex<HashMap<ShaderType, CachedPipeline>>>,
+    buffer_pool: Arc<Mutex<BufferPool>>,
 }
 
 impl Clone for WgpuDevice {
@@ -80,6 +238,7 @@ impl Clone for WgpuDevice {
             adapter: Arc::clone(&self.adapter),
             seed: Mutex::new(*self.seed.lock()),
             pipeline_cache: Arc::clone(&self.pipeline_cache),
+            buffer_pool: Arc::clone(&self.buffer_pool),
         }
     }
 }
@@ -151,6 +310,7 @@ impl WgpuDevice {
             adapter,
             seed: Mutex::new(299792458),
             pipeline_cache: Arc::new(Mutex::new(HashMap::new())),
+            buffer_pool: Arc::new(Mutex::new(BufferPool::new())),
         })
     }
 
@@ -171,12 +331,28 @@ impl WgpuDevice {
     }
 
     pub fn create_buffer(&self, size: u64, usage: wgpu::BufferUsages, label: &str) -> wgpu::Buffer {
+        // Pool only STORAGE-class buffers (the big compute buffers).
+        // Check if requested usage is a subset of pooled usage flags.
+        if POOLED_USAGE.contains(usage) {
+            return self.buffer_pool.lock().acquire(size, &self.device);
+        }
+
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,
             usage,
             mapped_at_creation: false,
         })
+    }
+
+    /// Wrap a buffer allocated from the pool (bucket-rounded size, returns to pool on drop).
+    pub fn wrap_pooled(&self, buffer: wgpu::Buffer) -> Arc<PooledBuffer> {
+        Arc::new(PooledBuffer::new(buffer, Arc::clone(&self.buffer_pool), true))
+    }
+
+    /// Wrap a non-pooled buffer (exact size, NOT returned to pool on drop).
+    pub fn wrap_buffer(&self, buffer: wgpu::Buffer) -> Arc<PooledBuffer> {
+        Arc::new(PooledBuffer::new(buffer, Arc::clone(&self.buffer_pool), false))
     }
 
     pub fn create_buffer_init(&self, data: &[u8], usage: wgpu::BufferUsages, label: &str) -> wgpu::Buffer {
@@ -526,7 +702,7 @@ impl BackendDevice for WgpuDevice {
         self.queue.write_buffer(&buffer, 0, &zeros);
 
         Ok(WgpuStorage::new(
-            Arc::new(buffer),
+            self.wrap_pooled(buffer),
             self.clone(),
             elem_count,
             dtype,
@@ -544,7 +720,7 @@ impl BackendDevice for WgpuDevice {
         );
 
         Ok(WgpuStorage::new(
-            Arc::new(buffer),
+            self.wrap_pooled(buffer),
             self.clone(),
             elem_count,
             dtype,
@@ -576,7 +752,7 @@ impl BackendDevice for WgpuDevice {
         );
 
         Ok(WgpuStorage::new(
-            Arc::new(buffer),
+            self.wrap_buffer(buffer),
             self.clone(),
             data.len(),
             T::DTYPE,
@@ -603,7 +779,7 @@ impl BackendDevice for WgpuDevice {
         );
 
         Ok(WgpuStorage::new(
-            Arc::new(buffer),
+            self.wrap_buffer(buffer),
             self.clone(),
             len,
             dtype,

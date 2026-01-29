@@ -1,6 +1,6 @@
 //! wgpu storage implementation
 
-use super::device::{buffer_size_bytes, ShaderType, WgpuDevice};
+use super::device::{buffer_size_bytes, PooledBuffer, ShaderType, WgpuDevice};
 use super::error::WgpuError;
 use super::flags::shader_flags;
 use crate::backend::{BackendDevice, BackendStorage};
@@ -8,7 +8,6 @@ use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvT
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Layout, Result};
 use std::sync::Arc;
-use wgpu::Buffer;
 
 /// Dimensions for F32 matmul shader (must match WGSL struct: M, N, K)
 #[repr(C)]
@@ -51,14 +50,14 @@ struct MatmulBF16Dimensions {
 /// Storage for tensors on a wgpu device
 #[derive(Debug, Clone)]
 pub struct WgpuStorage {
-    buffer: Arc<Buffer>,
+    buffer: Arc<PooledBuffer>,
     device: WgpuDevice,
     count: usize,
     dtype: DType,
 }
 
 impl WgpuStorage {
-    pub fn new(buffer: Arc<Buffer>, device: WgpuDevice, count: usize, dtype: DType) -> Self {
+    pub fn new(buffer: Arc<PooledBuffer>, device: WgpuDevice, count: usize, dtype: DType) -> Self {
         Self {
             buffer,
             device,
@@ -67,7 +66,7 @@ impl WgpuStorage {
         }
     }
 
-    pub fn buffer(&self) -> &Buffer {
+    pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
     }
 
@@ -397,7 +396,7 @@ impl WgpuStorage {
         });
 
         Ok(WgpuStorage::new(
-            Arc::new(output_buffer),
+            self.device.wrap_pooled(output_buffer),
             self.device.clone(),
             shape.elem_count(),
             DType::BF16,
@@ -666,7 +665,7 @@ impl WgpuStorage {
         });
 
         Ok(WgpuStorage::new(
-            Arc::new(output_buffer),
+            self.device.wrap_pooled(output_buffer),
             self.device.clone(),
             elem_count,
             DType::BF16,
@@ -746,7 +745,7 @@ impl WgpuStorage {
         });
 
         Ok(WgpuStorage::new(
-            Arc::new(output_buffer),
+            self.device.wrap_pooled(output_buffer),
             self.device.clone(),
             elem_count,
             DType::BF16,
@@ -830,7 +829,7 @@ impl WgpuStorage {
         });
 
         Ok(WgpuStorage::new(
-            Arc::new(output_buffer),
+            self.device.wrap_pooled(output_buffer),
             self.device.clone(),
             elem_count,
             DType::BF16,
@@ -904,7 +903,7 @@ impl WgpuStorage {
         });
 
         Ok(WgpuStorage::new(
-            Arc::new(output_buffer),
+            self.device.wrap_pooled(output_buffer),
             self.device.clone(),
             elem_count,
             DType::BF16,
@@ -975,7 +974,7 @@ impl WgpuStorage {
         });
 
         Ok(WgpuStorage::new(
-            Arc::new(output_buffer),
+            self.device.wrap_pooled(output_buffer),
             self.device.clone(),
             elem_count,
             DType::F32,
@@ -1148,7 +1147,7 @@ impl WgpuStorage {
         });
 
         Ok(WgpuStorage::new(
-            Arc::new(output_buffer),
+            self.device.wrap_pooled(output_buffer),
             self.device.clone(),
             output_elem_count,
             DType::BF16,
@@ -1172,7 +1171,7 @@ impl WgpuStorage {
         );
 
         let mut dst = WgpuStorage::new(
-            Arc::new(output_buffer),
+            self.device.wrap_pooled(output_buffer),
             self.device.clone(),
             elem_count,
             self.dtype,
@@ -1361,7 +1360,7 @@ impl WgpuStorage {
         });
 
         Ok(WgpuStorage::new(
-            Arc::new(output_buffer),
+            self.device.wrap_pooled(output_buffer),
             self.device.clone(),
             output_size,
             DType::F32,
@@ -1495,7 +1494,7 @@ impl BackendStorage for WgpuStorage {
                 )?;
 
                 return Ok(WgpuStorage::new(
-                    Arc::new(reduced_buffer),
+                    self.device.wrap_pooled(reduced_buffer),
                     self.device.clone(),
                     num_rows,
                     DType::F32,
