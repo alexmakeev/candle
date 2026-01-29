@@ -1,5 +1,9 @@
 # Ledger
 
+## 2026-01-30 01:00
+Done: Implemented contiguous weight cache in Linear::new() (weight_t field) + fixed copy_strided 2D dispatch for large tensors (>65535 workgroups) + made k.transpose contiguous in attention. Result: 0.33 → 3.90 tok/s (12x), zero CPU fallback matmuls.
+Next: Further optimization — batch dispatches (700 submits/token), GEMV shader for m=1, matmul tiling with shared memory. Target: 50-100 tok/s.
+
 ## 2026-01-30 00:30
 Done: 5 parallel research agents completed — RDNA 3.5 optimization, NPU, non-contiguous matmul, dispatch overhead, BF16 matmul tiling. Key findings: (1) 4500/9560 matmuls fall to CPU because .t() in Linear creates non-contiguous RHS, (2) 700 queue.submit() per token, (3) no tiling/shared memory in matmul shader, (4) NPU unusable on Linux. Priority #1: make weights contiguous at load time.
 Next: Implement contiguous weight cache in Linear::new(), test on Lyuda. Then batch dispatches, then GEMV shader.
