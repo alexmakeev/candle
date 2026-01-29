@@ -1071,6 +1071,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 pub const COPY_STRIDED_BF16_SHADER: &str = r#"
 // BF16 strided copy: src[strides] → dst[contiguous]
 // Each thread writes one output u32 (2 packed BF16 elements)
+// Avoids runtime-variable array indexing (RADV driver bug workaround)
 
 @group(0) @binding(0) var<storage, read> src: array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
@@ -1080,9 +1081,7 @@ struct Params {
     src_offset: u32,
     dst_offset: u32,
     elem_count: u32,
-    // Shape dims (up to 6)
     shape_0: u32, shape_1: u32, shape_2: u32, shape_3: u32, shape_4: u32, shape_5: u32,
-    // Source strides (up to 6)
     stride_0: u32, stride_1: u32, stride_2: u32, stride_3: u32, stride_4: u32, stride_5: u32,
 }
 
@@ -1093,17 +1092,32 @@ fn bf16_read_src(idx: u32) -> u32 {
     return select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
 }
 
-fn flat_to_strided_idx(flat: u32) -> u32 {
+fn flat_to_src(flat: u32) -> u32 {
     var remaining = flat;
     var src_idx: u32 = params.src_offset;
-    let shapes = array<u32, 6>(params.shape_0, params.shape_1, params.shape_2, params.shape_3, params.shape_4, params.shape_5);
-    let strides = array<u32, 6>(params.stride_0, params.stride_1, params.stride_2, params.stride_3, params.stride_4, params.stride_5);
 
-    // Decompose flat index into multi-dim and apply strides
-    for (var d: i32 = i32(params.ndims) - 1; d >= 0; d = d - 1) {
-        let dim_idx = remaining % shapes[d];
-        remaining = remaining / shapes[d];
-        src_idx += dim_idx * strides[d];
+    if (params.ndims > 5u) {
+        src_idx += (remaining % params.shape_5) * params.stride_5;
+        remaining = remaining / params.shape_5;
+    }
+    if (params.ndims > 4u) {
+        src_idx += (remaining % params.shape_4) * params.stride_4;
+        remaining = remaining / params.shape_4;
+    }
+    if (params.ndims > 3u) {
+        src_idx += (remaining % params.shape_3) * params.stride_3;
+        remaining = remaining / params.shape_3;
+    }
+    if (params.ndims > 2u) {
+        src_idx += (remaining % params.shape_2) * params.stride_2;
+        remaining = remaining / params.shape_2;
+    }
+    if (params.ndims > 1u) {
+        src_idx += (remaining % params.shape_1) * params.stride_1;
+        remaining = remaining / params.shape_1;
+    }
+    if (params.ndims > 0u) {
+        src_idx += (remaining % params.shape_0) * params.stride_0;
     }
     return src_idx;
 }
@@ -1117,14 +1131,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    // First element
-    let src_idx_0 = flat_to_strided_idx(pair_idx * 2u);
+    let src_idx_0 = flat_to_src(pair_idx * 2u);
     let low = bf16_read_src(src_idx_0);
 
-    // Second element (if exists)
     var high: u32 = 0u;
     if (pair_idx * 2u + 1u < params.elem_count) {
-        let src_idx_1 = flat_to_strided_idx(pair_idx * 2u + 1u);
+        let src_idx_1 = flat_to_src(pair_idx * 2u + 1u);
         high = bf16_read_src(src_idx_1);
     }
 
@@ -1137,6 +1149,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// Supports up to 6 dimensions.
 pub const COPY_STRIDED_F32_SHADER: &str = r#"
 // F32 strided copy: src[strides] → dst[contiguous]
+// Avoids runtime-variable array indexing (RADV driver bug workaround)
 
 @group(0) @binding(0) var<storage, read> src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
@@ -1152,6 +1165,38 @@ struct Params {
 
 @group(0) @binding(2) var<uniform> params: Params;
 
+fn flat_to_src(flat: u32) -> u32 {
+    var remaining = flat;
+    var src_idx: u32 = params.src_offset;
+
+    // Unrolled: process dims from innermost to outermost
+    // Each dim only participates if ndims > dim_index
+    if (params.ndims > 5u) {
+        src_idx += (remaining % params.shape_5) * params.stride_5;
+        remaining = remaining / params.shape_5;
+    }
+    if (params.ndims > 4u) {
+        src_idx += (remaining % params.shape_4) * params.stride_4;
+        remaining = remaining / params.shape_4;
+    }
+    if (params.ndims > 3u) {
+        src_idx += (remaining % params.shape_3) * params.stride_3;
+        remaining = remaining / params.shape_3;
+    }
+    if (params.ndims > 2u) {
+        src_idx += (remaining % params.shape_2) * params.stride_2;
+        remaining = remaining / params.shape_2;
+    }
+    if (params.ndims > 1u) {
+        src_idx += (remaining % params.shape_1) * params.stride_1;
+        remaining = remaining / params.shape_1;
+    }
+    if (params.ndims > 0u) {
+        src_idx += (remaining % params.shape_0) * params.stride_0;
+    }
+    return src_idx;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let flat_idx = global_id.x;
@@ -1160,18 +1205,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    var remaining = flat_idx;
-    var src_idx: u32 = params.src_offset;
-    let shapes = array<u32, 6>(params.shape_0, params.shape_1, params.shape_2, params.shape_3, params.shape_4, params.shape_5);
-    let strides = array<u32, 6>(params.stride_0, params.stride_1, params.stride_2, params.stride_3, params.stride_4, params.stride_5);
-
-    for (var d: i32 = i32(params.ndims) - 1; d >= 0; d = d - 1) {
-        let dim_idx = remaining % shapes[d];
-        remaining = remaining / shapes[d];
-        src_idx += dim_idx * strides[d];
-    }
-
-    dst[params.dst_offset + flat_idx] = src[src_idx];
+    dst[params.dst_offset + flat_idx] = src[flat_to_src(flat_idx)];
 }
 "#;
 

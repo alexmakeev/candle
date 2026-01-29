@@ -1148,83 +1148,8 @@ impl WgpuStorage {
             "copy_strided_internal_params",
         );
 
-        // BF16: use composition BF16→F32 + F32 strided copy + F32→BF16
-        // (direct BF16 strided copy shader causes segfault on RADV/gfx1151)
-        if self.dtype == DType::BF16 {
-            // Cast BF16 src to F32 (contiguous, full buffer)
-            let f32_src = self.cast_bf16_to_f32_gpu(&self.buffer, self.count)?;
-
-            // Create F32 destination buffer
-            let dst_total_elems = dst.count; // same total count
-            let f32_dst_buf = self.device.device().create_buffer(&wgpu::BufferDescriptor {
-                label: Some("copy_strided_f32_dst"),
-                size: (dst_total_elems * 4) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let mut f32_dst = WgpuStorage::new(
-                Arc::new(f32_dst_buf),
-                self.device.clone(),
-                dst_total_elems,
-                DType::F32,
-            );
-
-            // F32 strided copy using working F32 shader
-            let f32_params = CopyStridedParams {
-                ndims: ndims as u32,
-                src_offset: src_l.start_offset() as u32,
-                dst_offset: dst_offset as u32,
-                elem_count: elem_count as u32,
-                shape: shape_arr,
-                strides: stride_arr,
-            };
-            let f32_params_buffer = self.device.create_buffer_init(
-                bytemuck::bytes_of(&f32_params),
-                wgpu::BufferUsages::UNIFORM,
-                "copy_strided_f32_params",
-            );
-            let workgroups = ((elem_count as u32) + 255) / 256;
-            self.device.with_pipeline(ShaderType::CopyStridedF32, |cached| {
-                let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("copy_strided_f32_bind_group"),
-                    layout: &cached.bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: f32_src.buffer().as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: f32_dst.buffer().as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: f32_params_buffer.as_entire_binding(),
-                        },
-                    ],
-                });
-                let mut encoder = self.device.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("copy_strided_f32_encoder"),
-                });
-                {
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("copy_strided_f32_pass"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(&cached.pipeline);
-                    pass.set_bind_group(0, &bind_group, &[]);
-                    pass.dispatch_workgroups(workgroups, 1, 1);
-                }
-                self.device.queue().submit(std::iter::once(encoder.finish()));
-            });
-
-            // Cast F32 dst back to BF16
-            let bf16_result = self.cast_f32_to_bf16_gpu(f32_dst.buffer(), dst_total_elems)?;
-            *dst = bf16_result;
-            return Ok(());
-        }
-
         let shader_type = match self.dtype {
+            DType::BF16 => ShaderType::CopyStridedBF16,
             DType::F32 => ShaderType::CopyStridedF32,
             _ => {
                 return Err(crate::Error::Msg(format!(
