@@ -525,7 +525,9 @@ impl candle::CustomOp3 for RotaryEmb {
         if s1.dtype() != candle::DType::BF16 {
             candle::bail!("rope on wgpu: only BF16 supported, got {:?}", s1.dtype());
         }
+        eprintln!("[WGPU-TRACE] rope_bf16_gpu src={:?} cos={:?} sin={:?}", l1.shape(), l2.shape(), l3.shape());
         let result = s1.rope_bf16_gpu(s2, s3, l1, l2, l3)?;
+        eprintln!("[WGPU-TRACE] rope_bf16_gpu DONE");
         Ok((result, l1.shape().clone()))
     }
 }

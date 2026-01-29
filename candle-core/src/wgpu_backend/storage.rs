@@ -1325,8 +1325,10 @@ impl BackendStorage for WgpuStorage {
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         if self.dtype == DType::BF16 && layout.is_contiguous() {
+            eprintln!("[WGPU-TRACE] affine BF16 GPU, shape={:?}", layout.shape());
             return self.affine_bf16_gpu(layout, mul as f32, add as f32);
         }
+        eprintln!("[WGPU-TRACE] affine CPU fallback, dtype={:?}", self.dtype);
         self.from_cpu_op(layout, |cpu, l| cpu.affine(l, mul, add))
     }
 
@@ -1339,6 +1341,7 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, dims: &[usize]) -> Result<Self> {
+        eprintln!("[WGPU-TRACE] reduce_op {:?}, dtype={:?}, shape={:?}, dims={:?}", op, self.dtype, layout.shape(), dims);
         // GPU path for BF16: last-dim-only Sum/Max via composition
         // BF16→F32 cast + F32 reduce shader + F32→BF16 cast
         if self.dtype == DType::BF16 && layout.is_contiguous() && dims.len() == 1 {
@@ -1424,6 +1427,7 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        eprintln!("[WGPU-TRACE] to_dtype {:?}->{:?} shape={:?} contig={}", self.dtype, dtype, layout.shape(), layout.is_contiguous());
         // GPU-native BF16↔F32 casts (contiguous only)
         if layout.is_contiguous() {
             match (self.dtype, dtype) {
@@ -1443,6 +1447,7 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        eprintln!("[WGPU-TRACE] unary {} dtype={:?} shape={:?} contig={}", B::NAME, self.dtype, layout.shape(), layout.is_contiguous());
         // GPU path for BF16 contiguous tensors
         if self.dtype == DType::BF16 && layout.is_contiguous() {
             let op_type: u32 = match B::NAME {
@@ -1474,6 +1479,7 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn binary_impl<B: BinaryOpT>(&self, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        eprintln!("[WGPU-TRACE] binary {} dtype={:?} lhs={:?} rhs={:?} contig={}/{}", B::NAME, self.dtype, lhs_l.shape(), rhs_l.shape(), lhs_l.is_contiguous(), rhs_l.is_contiguous());
         // GPU path for BF16 contiguous tensors
         if self.dtype == DType::BF16 && lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             let op_type: u32 = match B::NAME {
@@ -1640,6 +1646,7 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
+        eprintln!("[WGPU-TRACE] index_select dim={} dtype={:?} src_shape={:?} ids_shape={:?}", dim, self.dtype, l.shape(), ids_l.shape());
         // GPU path for BF16 dim=0 (embedding lookup) with even row_size
         if self.dtype == DType::BF16 && dim == 0 && l.is_contiguous() && ids_l.is_contiguous() {
             let src_dims = l.dims();
@@ -1684,6 +1691,7 @@ impl BackendStorage for WgpuStorage {
         rhs_l: &Layout,
     ) -> Result<Self> {
         let (b, m, n, k) = bmnk;
+        eprintln!("[WGPU-TRACE] matmul dtype={:?} b={} m={} n={} k={} contig={}/{}", self.dtype, b, m, n, k, lhs_l.is_contiguous(), rhs_l.is_contiguous());
 
         let is_contiguous = lhs_l.is_contiguous() && rhs_l.is_contiguous();
         let is_unbatched = b == 1;
@@ -1710,6 +1718,7 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
+        eprintln!("[WGPU-TRACE] copy_strided_src dtype={:?} shape={:?} contig={} offset={}", self.dtype, src_l.shape(), src_l.is_contiguous(), dst_offset);
         // If contiguous, use a simple buffer copy
         if src_l.is_contiguous() {
             let elem_size = self.dtype.size_in_bytes();

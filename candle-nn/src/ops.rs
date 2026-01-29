@@ -438,7 +438,9 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         if storage.dtype() != candle::DType::BF16 {
             candle::bail!("softmax-last-dim on wgpu: only BF16 supported, got {:?}", storage.dtype());
         }
+        eprintln!("[WGPU-TRACE] softmax_bf16_gpu shape={:?}", layout.shape());
         let result = storage.softmax_bf16_gpu(layout)?;
+        eprintln!("[WGPU-TRACE] softmax_bf16_gpu DONE");
         Ok((result, layout.shape().clone()))
     }
 }
@@ -650,7 +652,9 @@ impl candle::CustomOp2 for RmsNorm {
         if s1.dtype() != candle::DType::BF16 {
             candle::bail!("rms-norm on wgpu: only BF16 supported, got {:?}", s1.dtype());
         }
+        eprintln!("[WGPU-TRACE] rms_norm_bf16_gpu shape={:?} eps={}", l1.shape(), self.eps);
         let result = s1.rms_norm_bf16_gpu(s2, l1, l2, self.eps)?;
+        eprintln!("[WGPU-TRACE] rms_norm_bf16_gpu DONE");
         Ok((result, l1.shape().clone()))
     }
 }
