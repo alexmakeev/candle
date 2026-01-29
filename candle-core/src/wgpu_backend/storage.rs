@@ -404,9 +404,11 @@ impl WgpuStorage {
         ))
     }
 
-    /// BF16 softmax (last dim) on GPU.
+    /// BF16 softmax (last dim) on GPU — outputs BF16 directly (no separate cast dispatch).
     /// x: [..., last_dim] BF16 contiguous
     /// output: same shape, BF16
+    /// The shader recomputes exp() in the output phase to avoid needing F32 scratch memory.
+    /// This eliminates one GPU dispatch per softmax call compared to the old F32+cast approach.
     pub fn softmax_bf16_gpu(&self, layout: &Layout) -> Result<Self> {
         let shape = layout.shape();
         let dims = shape.dims();
@@ -415,12 +417,12 @@ impl WgpuStorage {
         })?;
         let num_rows = shape.elem_count() / last_dim;
 
-        // Softmax BF16 shader outputs F32, we need to cast back
-        let f32_output_bytes = shape.elem_count() * std::mem::size_of::<f32>();
-        let f32_output_buffer = self.device.create_buffer(
-            f32_output_bytes as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            "softmax_bf16_f32_output",
+        // Output buffer is BF16-sized (no F32 scratch needed — shader recomputes exp).
+        let output_bytes = buffer_size_bytes(shape.elem_count(), DType::BF16);
+        let output_buffer = self.device.create_buffer(
+            output_bytes as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "softmax_bf16_output",
         );
 
         #[repr(C)]
@@ -451,7 +453,7 @@ impl WgpuStorage {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: f32_output_buffer.as_entire_binding(),
+                        resource: output_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -478,8 +480,13 @@ impl WgpuStorage {
             self.device.queue().submit(std::iter::once(encoder.finish()));
         });
 
-        // Cast F32 output back to BF16 on GPU
-        self.cast_f32_to_bf16_gpu(&f32_output_buffer, shape.elem_count())
+        // Shader already wrote BF16 packed output — no cast dispatch needed
+        Ok(WgpuStorage::new(
+            Arc::new(output_buffer),
+            self.device.clone(),
+            shape.elem_count(),
+            DType::BF16,
+        ))
     }
 
     /// BF16 RoPE on GPU. Returns BF16 output.
@@ -862,9 +869,9 @@ impl WgpuStorage {
             "cast_f32_to_bf16_params",
         );
 
-        // Each thread handles 2 elements (one packed u32)
-        let num_pairs = (elem_count + 1) / 2;
-        let workgroups = ((num_pairs as u32) + 255) / 256;
+        // Each thread handles 8 elements (4 packed u32s)
+        let num_threads = (elem_count + 7) / 8;
+        let workgroups = ((num_threads as u32) + 255) / 256;
 
         self.device.with_pipeline(ShaderType::CastF32ToBF16, |cached| {
             let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
@@ -935,7 +942,9 @@ impl WgpuStorage {
             "cast_bf16_to_f32_params",
         );
 
-        let workgroups = ((elem_count as u32) + 255) / 256;
+        // Each thread handles 8 elements (4 packed u32s)
+        let num_threads = (elem_count + 7) / 8;
+        let workgroups = ((num_threads as u32) + 255) / 256;
 
         self.device.with_pipeline(ShaderType::CastBF16ToF32, |cached| {
             let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {

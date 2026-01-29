@@ -925,17 +925,22 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
-/// BF16 fused softmax shader
+/// BF16 fused softmax shader — outputs BF16 directly (no F32 cast needed)
 /// Input: BF16 packed as u32 (2 BF16 per u32, little-endian)
-/// Output: F32 array (will be converted to BF16 on CPU)
+/// Output: BF16 packed as u32 (2 BF16 per u32)
 /// Computes softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
+/// Phase 1: find max, Phase 2: compute exp and accumulate sum,
+/// Phase 3: re-read input, re-compute exp, normalize, and pack BF16 output.
+/// No F32 scratch buffer needed — exp is recomputed from input in Phase 3.
 pub const SOFTMAX_BF16_SHADER: &str = r#"
-// BF16 Fused softmax along last dimension
+// BF16 Fused softmax along last dimension — native BF16 output
 // Input: BF16 packed as u32 (2 BF16 per u32)
-// Output: F32 array
+// Output: BF16 packed as u32 (2 BF16 per u32)
+// No intermediate F32 buffer: exp() is computed twice (Phase 2 for sum, Phase 3 for output).
+// This is faster than an extra global memory round-trip for softmax rows typical in LLM attention.
 
 @group(0) @binding(0) var<storage, read> input: array<u32>;
-@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
 
 struct Params {
     num_rows: u32,
@@ -951,7 +956,12 @@ fn bf16_to_f32(bits: u32) -> f32 {
     return bitcast<f32>(bits << 16u);
 }
 
-// Read BF16 value at logical index
+// Convert F32 to BF16 (truncate lower 16 bits)
+fn f32_to_bf16(val: f32) -> u32 {
+    return bitcast<u32>(val) >> 16u;
+}
+
+// Read BF16 value at logical index from input
 fn read_bf16(idx: u32) -> f32 {
     let packed_idx = idx / 2u;
     let is_high = (idx % 2u) == 1u;
@@ -1004,14 +1014,12 @@ fn main(
     let row_max = shared_data[0];
     workgroupBarrier();
 
-    // === Phase 2: Compute exp(x - max) and sum ===
+    // === Phase 2: Compute sum of exp(x - max) ===
     var local_sum: f32 = 0.0;
     i = local_idx;
     while (i < params.row_size) {
         let val = read_bf16(row_offset + i);
-        let exp_val = exp(val - row_max);
-        output[row_offset + i] = exp_val;
-        local_sum += exp_val;
+        local_sum += exp(val - row_max);
         i += 256u;
     }
 
@@ -1028,14 +1036,29 @@ fn main(
         stride = stride / 2u;
     }
 
-    let row_sum = shared_data[0];
+    let inv_sum = 1.0 / shared_data[0];
     workgroupBarrier();
 
-    // === Phase 3: Normalize ===
-    i = local_idx;
-    while (i < params.row_size) {
-        output[row_offset + i] /= row_sum;
-        i += 256u;
+    // === Phase 3: Re-compute exp, normalize, and pack BF16 pairs ===
+    // Each thread processes pairs of adjacent elements, strided by 512 (256 threads * 2 elements).
+    let half_row = (params.row_size + 1u) / 2u;
+    let out_row_offset = row_idx * half_row;
+    var p: u32 = local_idx;
+    while (p < half_row) {
+        let elem0 = p * 2u;
+        let elem1 = elem0 + 1u;
+
+        let val0 = read_bf16(row_offset + elem0);
+        let bf16_low = f32_to_bf16(exp(val0 - row_max) * inv_sum);
+
+        var bf16_high: u32 = 0u;
+        if (elem1 < params.row_size) {
+            let val1 = read_bf16(row_offset + elem1);
+            bf16_high = f32_to_bf16(exp(val1 - row_max) * inv_sum);
+        }
+
+        output[out_row_offset + p] = bf16_low | (bf16_high << 16u);
+        p += 256u;
     }
 }
 "#;
@@ -1136,10 +1159,10 @@ fn main(
 "#;
 
 
-/// F32 → BF16 cast shader
+/// F32 → BF16 cast shader (wide: 8 elements per thread via vec4 loads)
 /// Reads F32 array, writes BF16 packed as u32 (2 BF16 per u32, little-endian)
 pub const CAST_F32_TO_BF16_SHADER: &str = r#"
-// F32 → BF16 cast
+// F32 → BF16 cast (wide: 8 elements / 4 output u32s per thread)
 // Input: F32 array (elem_count elements)
 // Output: u32 array (packed BF16, ceil(elem_count/2) u32s)
 
@@ -1159,28 +1182,38 @@ fn f32_to_bf16(val: f32) -> u32 {
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    // Each thread handles one pair of elements (packed into one u32)
-    let pair_idx = global_id.x;
-    let elem_idx = pair_idx * 2u;
+    // Each thread handles 8 elements (4 output u32s)
+    let thread_idx = global_id.x;
+    let base_elem = thread_idx * 8u;
 
-    if (elem_idx >= params.elem_count) {
+    if (base_elem >= params.elem_count) {
         return;
     }
 
-    let low = f32_to_bf16(input[elem_idx]);
-    var high: u32 = 0u;
-    if (elem_idx + 1u < params.elem_count) {
-        high = f32_to_bf16(input[elem_idx + 1u]);
-    }
+    let base_pair = thread_idx * 4u;
 
-    output[pair_idx] = low | (high << 16u);
+    // Process 4 pairs (8 elements)
+    for (var p: u32 = 0u; p < 4u; p++) {
+        let elem_idx = base_elem + p * 2u;
+        if (elem_idx >= params.elem_count) {
+            return;
+        }
+
+        let low = f32_to_bf16(input[elem_idx]);
+        var high: u32 = 0u;
+        if (elem_idx + 1u < params.elem_count) {
+            high = f32_to_bf16(input[elem_idx + 1u]);
+        }
+
+        output[base_pair + p] = low | (high << 16u);
+    }
 }
 "#;
 
-/// BF16 → F32 cast shader
+/// BF16 → F32 cast shader (wide: 8 elements per thread)
 /// Reads BF16 packed as u32, writes F32 array
 pub const CAST_BF16_TO_F32_SHADER: &str = r#"
-// BF16 → F32 cast
+// BF16 → F32 cast (wide: 8 elements / 4 input u32s per thread)
 // Input: u32 array (packed BF16, 2 BF16 per u32)
 // Output: F32 array (elem_count elements)
 
@@ -1200,21 +1233,28 @@ fn bf16_to_f32(bits: u32) -> f32 {
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let idx = global_id.x;
+    // Each thread handles 8 elements (4 packed u32s)
+    let thread_idx = global_id.x;
+    let base_elem = thread_idx * 8u;
 
-    if (idx >= params.elem_count) {
+    if (base_elem >= params.elem_count) {
         return;
     }
 
-    let packed_idx = idx / 2u;
-    let is_high = (idx % 2u) == 1u;
-    let packed = input[packed_idx];
-    let bf16_bits = select(
-        packed & 0xFFFFu,
-        packed >> 16u,
-        is_high
-    );
-    output[idx] = bf16_to_f32(bf16_bits);
+    // Process 4 packed u32s (8 BF16 elements)
+    for (var p: u32 = 0u; p < 4u; p++) {
+        let elem_idx = base_elem + p * 2u;
+        if (elem_idx >= params.elem_count) {
+            return;
+        }
+
+        let packed = input[elem_idx / 2u];
+        output[elem_idx] = bf16_to_f32(packed & 0xFFFFu);
+
+        if (elem_idx + 1u < params.elem_count) {
+            output[elem_idx + 1u] = bf16_to_f32(packed >> 16u);
+        }
+    }
 }
 "#;
 
