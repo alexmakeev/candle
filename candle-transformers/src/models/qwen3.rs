@@ -222,7 +222,7 @@ impl Qwen3Attention {
 
         // 7. Attention score
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let mut scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
         if let Some(m) = attn_mask {
             scores = scores.broadcast_add(m)?;
         }
