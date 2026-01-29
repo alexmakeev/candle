@@ -1707,10 +1707,10 @@ impl BackendStorage for WgpuStorage {
             return self.matmul_gpu(rhs, m, n, k);
         }
 
-        // Non-contiguous BF16: CPU fallback for now (strided copy shader needs debugging)
-        // TODO: use make_contiguous_gpu + matmul_bf16_gpu once strided copy BF16 is verified
-        if self.dtype == DType::BF16 && !is_contiguous {
-            eprintln!("[WGPU-TRACE] matmul non-contiguous BF16: CPU fallback");
+        // BF16 CPU fallback: convert to F32, matmul, convert back
+        // Handles both non-contiguous and contiguous (when GPU flag is off)
+        if self.dtype == DType::BF16 {
+            eprintln!("[WGPU-TRACE] matmul BF16 CPU fallback (contig={}/{})", lhs_l.is_contiguous(), rhs_l.is_contiguous());
             let lhs_cpu = self.to_cpu_storage()?;
             let rhs_cpu = rhs.to_cpu_storage()?;
             let lhs_f32 = lhs_cpu.to_dtype(lhs_l, DType::F32)?;
