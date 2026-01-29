@@ -253,9 +253,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// WGSL shader for reduce max along last dimension
 /// Reduces input[batch, reduce_dim] -> output[batch]
 pub const REDUCE_MAX_LAST_DIM_SHADER: &str = r#"
+enable subgroups;
+
 // Reduce Max along last dimension
 // Input: [num_rows, row_size]
 // Output: [num_rows]
+// Uses subgroup operations for fast register-level reductions.
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
@@ -267,14 +270,16 @@ struct Params {
 
 @group(0) @binding(2) var<uniform> params: Params;
 
-// Shared memory for reduction within workgroup
-var<workgroup> shared_max: array<f32, 256>;
+// Shared memory for cross-subgroup reduction (max 8 subgroups for 256/32)
+var<workgroup> shared_max: array<f32, 8>;
 
 @compute @workgroup_size(256)
 fn main(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_size) sg_size: u32,
 ) {
     let row_idx = wid.x;
     let local_idx = lid.x;
@@ -293,22 +298,26 @@ fn main(
         i += 256u;
     }
 
-    shared_max[local_idx] = local_max;
+    // Phase 1: subgroup-level reduction
+    let sg_max = subgroupMax(local_max);
+
+    // Phase 2: cross-subgroup reduction via shared memory
+    let num_subgroups = 256u / sg_size;
+    let sg_id = local_idx / sg_size;
+    if (sg_lane == 0u) {
+        shared_max[sg_id] = sg_max;
+    }
     workgroupBarrier();
 
-    // Parallel reduction in shared memory
-    var stride: u32 = 128u;
-    while (stride > 0u) {
-        if (local_idx < stride && local_idx + stride < 256u) {
-            shared_max[local_idx] = max(shared_max[local_idx], shared_max[local_idx + stride]);
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
+    // Phase 3: final reduction (first subgroup)
+    var final_max: f32 = -3.4028235e+38;
+    if (local_idx < num_subgroups) {
+        final_max = subgroupMax(shared_max[local_idx]);
     }
 
     // Thread 0 writes result
     if (local_idx == 0u) {
-        output[row_idx] = shared_max[0];
+        output[row_idx] = final_max;
     }
 }
 "#;
@@ -316,9 +325,12 @@ fn main(
 /// WGSL shader for reduce sum along last dimension
 /// Reduces input[batch, reduce_dim] -> output[batch]
 pub const REDUCE_SUM_LAST_DIM_SHADER: &str = r#"
+enable subgroups;
+
 // Reduce Sum along last dimension
 // Input: [num_rows, row_size]
 // Output: [num_rows]
+// Uses subgroup operations for fast register-level reductions.
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
@@ -330,14 +342,16 @@ struct Params {
 
 @group(0) @binding(2) var<uniform> params: Params;
 
-// Shared memory for reduction within workgroup
-var<workgroup> shared_sum: array<f32, 256>;
+// Shared memory for cross-subgroup reduction (max 8 subgroups for 256/32)
+var<workgroup> shared_sum: array<f32, 8>;
 
 @compute @workgroup_size(256)
 fn main(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_size) sg_size: u32,
 ) {
     let row_idx = wid.x;
     let local_idx = lid.x;
@@ -356,22 +370,26 @@ fn main(
         i += 256u;
     }
 
-    shared_sum[local_idx] = local_sum;
+    // Phase 1: subgroup-level reduction
+    let sg_sum = subgroupAdd(local_sum);
+
+    // Phase 2: cross-subgroup reduction via shared memory
+    let num_subgroups = 256u / sg_size;
+    let sg_id = local_idx / sg_size;
+    if (sg_lane == 0u) {
+        shared_sum[sg_id] = sg_sum;
+    }
     workgroupBarrier();
 
-    // Parallel reduction in shared memory
-    var stride: u32 = 128u;
-    while (stride > 0u) {
-        if (local_idx < stride && local_idx + stride < 256u) {
-            shared_sum[local_idx] += shared_sum[local_idx + stride];
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
+    // Phase 3: final reduction (first subgroup)
+    var final_sum: f32 = 0.0;
+    if (local_idx < num_subgroups) {
+        final_sum = subgroupAdd(shared_sum[local_idx]);
     }
 
     // Thread 0 writes result
     if (local_idx == 0u) {
-        output[row_idx] = shared_sum[0];
+        output[row_idx] = final_sum;
     }
 }
 "#;
@@ -557,9 +575,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// Each workgroup computes one output element via parallel reduction over K.
 /// Vectorized BF16 loads (4 values per vec2<u32> load).
 pub const GEMV_BF16_SHADER: &str = r#"
+enable subgroups;
+
 // GEMV: A[b, 1, K] @ B[b, K, N] -> C[b, 1, N]
 // Specialized for m=1 case. Each workgroup computes ONE output element C[batch, 0, col].
 // 256 threads collaborate on the K-dimension reduction.
+// Uses subgroup operations for fast register-level reductions.
 // Input: BF16 packed as u32 (2 BF16 per u32, little-endian, row-major)
 // Output: F32 array
 
@@ -581,8 +602,8 @@ struct Dimensions {
 
 const WG_SIZE: u32 = 256u;
 
-// Shared memory for partial sums — each thread stores its partial dot product
-var<workgroup> shared_partials: array<f32, 256>;
+// Shared memory for cross-subgroup reduction (max 8 subgroups for 256/32)
+var<workgroup> shared_partials: array<f32, 8>;
 
 fn bf16_to_f32(bits: u32) -> f32 {
     return bitcast<f32>(bits << 16u);
@@ -593,6 +614,8 @@ fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(num_workgroups) num_wg: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_size) sg_size: u32,
 ) {
     let tid = local_id.x;
     let col = wg_id.x + wg_id.y * num_wg.x;  // 2D linearization for large N (>65535)
@@ -674,33 +697,27 @@ fn main(
         partial_sum = partial_sum + a_val * b_val;
     }
 
-    // Parallel reduction in shared memory.
-    // All 256 threads must participate in every barrier (WGSL requirement).
-    shared_partials[tid] = partial_sum;
+    // Phase 1: subgroup-level reduction (register shuffles, no shared memory)
+    let subgroup_sum = subgroupAdd(partial_sum);
+
+    // Phase 2: cross-subgroup reduction via shared memory
+    let num_subgroups = WG_SIZE / sg_size;
+    let sg_id = tid / sg_size;
+    if (sg_lane == 0u) {
+        shared_partials[sg_id] = subgroup_sum;
+    }
     workgroupBarrier();
 
-    // Tree reduction: 256 -> 128 -> 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
-    if (tid < 128u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 128u]; }
-    workgroupBarrier();
-    if (tid < 64u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 64u]; }
-    workgroupBarrier();
-    if (tid < 32u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 32u]; }
-    workgroupBarrier();
-    if (tid < 16u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 2u]; }
-    workgroupBarrier();
-    if (tid < 1u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 1u]; }
-    workgroupBarrier();
+    // Phase 3: final reduction (first subgroup reduces across all subgroup results)
+    var final_sum: f32 = 0.0;
+    if (tid < num_subgroups) {
+        final_sum = subgroupAdd(shared_partials[tid]);
+    }
 
     // Thread 0 writes the final dot product result
     if (tid == 0u) {
         let c_idx = c_offset + col;
-        c[c_idx] = shared_partials[0];
+        c[c_idx] = final_sum;
     }
 }
 "#;
@@ -930,9 +947,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// Output: F32 array (will be converted to BF16 on CPU)
 /// Computes softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
 pub const SOFTMAX_BF16_SHADER: &str = r#"
+enable subgroups;
+
 // BF16 Fused softmax along last dimension
 // Input: BF16 packed as u32 (2 BF16 per u32)
 // Output: F32 array
+// Uses subgroup operations for fast register-level reductions.
 
 @group(0) @binding(0) var<storage, read> input: array<u32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
@@ -944,7 +964,8 @@ struct Params {
 
 @group(0) @binding(2) var<uniform> params: Params;
 
-var<workgroup> shared_data: array<f32, 256>;
+// Shared memory for cross-subgroup reduction (max 8 subgroups for 256/32)
+var<workgroup> shared_data: array<f32, 8>;
 
 // Convert BF16 (16-bit) to F32
 fn bf16_to_f32(bits: u32) -> f32 {
@@ -968,7 +989,9 @@ fn read_bf16(idx: u32) -> f32 {
 fn main(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_size) sg_size: u32,
 ) {
     let row_idx = wid.x;
     let local_idx = lid.x;
@@ -978,6 +1001,8 @@ fn main(
     }
 
     let row_offset = row_idx * params.row_size;
+    let num_subgroups = 256u / sg_size;
+    let sg_id = local_idx / sg_size;
 
     // === Phase 1: Find max ===
     var local_max: f32 = -3.4028235e+38;
@@ -988,20 +1013,24 @@ fn main(
         i += 256u;
     }
 
-    shared_data[local_idx] = local_max;
+    // Subgroup max reduction
+    let sg_max = subgroupMax(local_max);
+    if (sg_lane == 0u) {
+        shared_data[sg_id] = sg_max;
+    }
     workgroupBarrier();
 
-    // Reduce to find global max
-    var stride: u32 = 128u;
-    while (stride > 0u) {
-        if (local_idx < stride && local_idx + stride < 256u) {
-            shared_data[local_idx] = max(shared_data[local_idx], shared_data[local_idx + stride]);
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
+    // Final max reduction (first subgroup)
+    var row_max: f32 = -3.4028235e+38;
+    if (local_idx < num_subgroups) {
+        row_max = subgroupMax(shared_data[local_idx]);
     }
-
-    let row_max = shared_data[0];
+    // Broadcast row_max to all threads
+    if (local_idx == 0u) {
+        shared_data[0] = row_max;
+    }
+    workgroupBarrier();
+    row_max = shared_data[0];
     workgroupBarrier();
 
     // === Phase 2: Compute exp(x - max) and sum ===
@@ -1015,21 +1044,24 @@ fn main(
         i += 256u;
     }
 
-    shared_data[local_idx] = local_sum;
-    workgroupBarrier();
-
-    // Reduce to find sum
-    stride = 128u;
-    while (stride > 0u) {
-        if (local_idx < stride && local_idx + stride < 256u) {
-            shared_data[local_idx] += shared_data[local_idx + stride];
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
+    // Subgroup sum reduction
+    let sg_sum = subgroupAdd(local_sum);
+    if (sg_lane == 0u) {
+        shared_data[sg_id] = sg_sum;
     }
-
-    let row_sum = shared_data[0];
     workgroupBarrier();
+
+    // Final sum reduction (first subgroup)
+    var row_sum: f32 = 0.0;
+    if (local_idx < num_subgroups) {
+        row_sum = subgroupAdd(shared_data[local_idx]);
+    }
+    // Broadcast row_sum to all threads
+    if (local_idx == 0u) {
+        shared_data[0] = row_sum;
+    }
+    workgroupBarrier();
+    row_sum = shared_data[0];
 
     // === Phase 3: Normalize ===
     i = local_idx;
@@ -1043,11 +1075,14 @@ fn main(
 /// Fused softmax shader - does everything in one kernel
 /// This is more efficient than separate max/sub/exp/sum/div operations
 pub const SOFTMAX_FUSED_SHADER: &str = r#"
+enable subgroups;
+
 // Fused softmax along last dimension
 // softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
 //
 // This fused version avoids multiple kernel launches and memory transfers.
 // Each workgroup processes one row.
+// Uses subgroup operations for fast register-level reductions.
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
@@ -1059,13 +1094,16 @@ struct Params {
 
 @group(0) @binding(2) var<uniform> params: Params;
 
-var<workgroup> shared_data: array<f32, 256>;
+// Shared memory for cross-subgroup reduction (max 8 subgroups for 256/32)
+var<workgroup> shared_data: array<f32, 8>;
 
 @compute @workgroup_size(256)
 fn main(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_size) sg_size: u32,
 ) {
     let row_idx = wid.x;
     let local_idx = lid.x;
@@ -1075,6 +1113,8 @@ fn main(
     }
 
     let row_offset = row_idx * params.row_size;
+    let num_subgroups = 256u / sg_size;
+    let sg_id = local_idx / sg_size;
 
     // === Phase 1: Find max ===
     var local_max: f32 = -3.4028235e+38;
@@ -1084,20 +1124,24 @@ fn main(
         i += 256u;
     }
 
-    shared_data[local_idx] = local_max;
+    // Subgroup max reduction
+    let sg_max = subgroupMax(local_max);
+    if (sg_lane == 0u) {
+        shared_data[sg_id] = sg_max;
+    }
     workgroupBarrier();
 
-    // Reduce to find global max
-    var stride: u32 = 128u;
-    while (stride > 0u) {
-        if (local_idx < stride && local_idx + stride < 256u) {
-            shared_data[local_idx] = max(shared_data[local_idx], shared_data[local_idx + stride]);
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
+    // Final max reduction (first subgroup)
+    var row_max: f32 = -3.4028235e+38;
+    if (local_idx < num_subgroups) {
+        row_max = subgroupMax(shared_data[local_idx]);
     }
-
-    let row_max = shared_data[0];
+    // Broadcast row_max to all threads
+    if (local_idx == 0u) {
+        shared_data[0] = row_max;
+    }
+    workgroupBarrier();
+    row_max = shared_data[0];
     workgroupBarrier();
 
     // === Phase 2: Compute exp(x - max) and sum ===
@@ -1110,21 +1154,24 @@ fn main(
         i += 256u;
     }
 
-    shared_data[local_idx] = local_sum;
-    workgroupBarrier();
-
-    // Reduce to find sum
-    stride = 128u;
-    while (stride > 0u) {
-        if (local_idx < stride && local_idx + stride < 256u) {
-            shared_data[local_idx] += shared_data[local_idx + stride];
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
+    // Subgroup sum reduction
+    let sg_sum = subgroupAdd(local_sum);
+    if (sg_lane == 0u) {
+        shared_data[sg_id] = sg_sum;
     }
-
-    let row_sum = shared_data[0];
     workgroupBarrier();
+
+    // Final sum reduction (first subgroup)
+    var row_sum: f32 = 0.0;
+    if (local_idx < num_subgroups) {
+        row_sum = subgroupAdd(shared_data[local_idx]);
+    }
+    // Broadcast row_sum to all threads
+    if (local_idx == 0u) {
+        shared_data[0] = row_sum;
+    }
+    workgroupBarrier();
+    row_sum = shared_data[0];
 
     // === Phase 3: Normalize ===
     i = local_idx;
@@ -1373,9 +1420,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>,
 /// Computes: y = x * rsqrt(mean(x^2) + eps) * alpha
 /// One workgroup per row (batch element)
 pub const RMS_NORM_BF16_SHADER: &str = r#"
+enable subgroups;
+
 // BF16 RMS Normalization
 // Input, alpha: BF16 packed as u32 (2 BF16 per u32)
 // Output: BF16 packed as u32
+// Uses subgroup operations for fast register-level reductions.
 
 @group(0) @binding(0) var<storage, read> input: array<u32>;
 @group(0) @binding(1) var<storage, read> alpha: array<u32>;
@@ -1390,7 +1440,8 @@ struct Params {
 
 @group(0) @binding(3) var<uniform> params: Params;
 
-var<workgroup> shared_data: array<f32, 256>;
+// Shared memory for cross-subgroup reduction (max 8 subgroups for 256/32)
+var<workgroup> shared_data: array<f32, 8>;
 
 fn bf16_to_f32(bits: u32) -> f32 {
     return bitcast<f32>(bits << 16u);
@@ -1415,7 +1466,9 @@ fn read_alpha_bf16(idx: u32) -> f32 {
 @compute @workgroup_size(256)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_size) sg_size: u32,
 ) {
     let row_idx = wid.x;
     let local_idx = lid.x;
@@ -1426,7 +1479,7 @@ fn main(
 
     let row_offset = params.input_offset + row_idx * params.hidden_size;
 
-    // Phase 1: Compute sum of squares
+    // Phase 1: Compute sum of squares (each thread accumulates its portion)
     var local_sum_sq: f32 = 0.0;
     var i: u32 = local_idx;
     while (i < params.hidden_size) {
@@ -1435,21 +1488,29 @@ fn main(
         i += 256u;
     }
 
-    shared_data[local_idx] = local_sum_sq;
+    // Subgroup-level reduction
+    let sg_sum = subgroupAdd(local_sum_sq);
+
+    // Cross-subgroup reduction via shared memory
+    let num_subgroups = 256u / sg_size;
+    let sg_id = local_idx / sg_size;
+    if (sg_lane == 0u) {
+        shared_data[sg_id] = sg_sum;
+    }
     workgroupBarrier();
 
-    // Parallel reduction for sum of squares
-    var stride: u32 = 128u;
-    while (stride > 0u) {
-        if (local_idx < stride && local_idx + stride < 256u) {
-            shared_data[local_idx] += shared_data[local_idx + stride];
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
+    // Final reduction (first subgroup)
+    var total_sum_sq: f32 = 0.0;
+    if (local_idx < num_subgroups) {
+        total_sum_sq = subgroupAdd(shared_data[local_idx]);
     }
 
-    let rms_inv = inverseSqrt(shared_data[0] / f32(params.hidden_size) + params.eps);
+    // Broadcast rms_inv to all threads via shared memory
+    if (local_idx == 0u) {
+        shared_data[0] = inverseSqrt(total_sum_sq / f32(params.hidden_size) + params.eps);
+    }
     workgroupBarrier();
+    let rms_inv = shared_data[0];
 
     // Phase 2: Normalize and scale by alpha, write BF16 output (pair-based)
     let out_row_offset = row_idx * params.hidden_size;

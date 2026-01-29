@@ -126,7 +126,7 @@ impl WgpuDevice {
                 .request_device(
                     &wgpu::DeviceDescriptor {
                         label: Some("candle-wgpu"),
-                        required_features: wgpu::Features::empty(),
+                        required_features: wgpu::Features::SUBGROUP,
                         required_limits,
                         memory_hints: wgpu::MemoryHints::Performance,
                     },
