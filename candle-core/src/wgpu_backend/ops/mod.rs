@@ -553,13 +553,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 /// Specialized GEMV (matrix-vector multiply) shader for m=1 BF16 matmul.
 /// A[b, 1, K] @ B[b, K, N] -> C[b, 1, N]
-/// Uses 256-thread workgroups with shared memory for the input vector.
-/// Each workgroup computes one output element via parallel reduction over K.
-/// Vectorized BF16 loads (4 values per vec2<u32> load).
+/// Uses 256-thread workgroups with shared memory reduction.
+/// Each workgroup computes COLS_PER_WG=4 adjacent output columns to amortize A vector loads.
+/// Vectorized BF16 loads: A uses vec4<u32> (8 BF16 values per iteration).
+/// Dispatch: ceil(N/4) workgroups in x*y, batch in z.
 pub const GEMV_BF16_SHADER: &str = r#"
 // GEMV: A[b, 1, K] @ B[b, K, N] -> C[b, 1, N]
-// Specialized for m=1 case. Each workgroup computes ONE output element C[batch, 0, col].
-// 256 threads collaborate on the K-dimension reduction.
+// Specialized for m=1 case. Each workgroup computes 4 adjacent output columns.
+// 256 threads collaborate on the K-dimension reduction for all 4 columns.
+// A vector loads are shared across columns (loaded once, used 4x).
+// Each iteration loads vec4<u32> from A = 8 BF16 values.
 // Input: BF16 packed as u32 (2 BF16 per u32, little-endian, row-major)
 // Output: F32 array
 
@@ -580,12 +583,27 @@ struct Dimensions {
 @group(0) @binding(3) var<uniform> dims: Dimensions;
 
 const WG_SIZE: u32 = 256u;
+const COLS_PER_WG: u32 = 4u;
 
-// Shared memory for partial sums — each thread stores its partial dot product
-var<workgroup> shared_partials: array<f32, 256>;
+// Shared memory for partial sums: 4 columns x 256 threads
+var<workgroup> shared_partials: array<f32, 1024>;
 
 fn bf16_to_f32(bits: u32) -> f32 {
     return bitcast<f32>(bits << 16u);
+}
+
+// Extract 2 f32 values from a packed u32 containing 2 BF16
+fn unpack2(packed: u32) -> vec2<f32> {
+    return vec2<f32>(
+        bf16_to_f32(packed & 0xFFFFu),
+        bf16_to_f32(packed >> 16u),
+    );
+}
+
+// Read a single BF16 element from B matrix at BF16 element index
+fn read_b(idx: u32) -> f32 {
+    let packed = b[idx / 2u];
+    return select(bf16_to_f32(packed & 0xFFFFu), bf16_to_f32(packed >> 16u), (idx % 2u) == 1u);
 }
 
 @compute @workgroup_size(256)
@@ -595,71 +613,121 @@ fn main(
     @builtin(num_workgroups) num_wg: vec3<u32>,
 ) {
     let tid = local_id.x;
-    let col = wg_id.x + wg_id.y * num_wg.x;  // 2D linearization for large N (>65535)
-    let batch = wg_id.z;                       // batch in z dimension
+    let col_group = wg_id.x + wg_id.y * num_wg.x;  // 2D linearization for large N
+    let col_base = col_group * COLS_PER_WG;          // first of 4 columns this WG handles
+    let batch = wg_id.z;
 
-    // Guard: col may exceed N when grid is padded for 2D dispatch
-    if (col >= dims.N) {
+    // Guard: entire column group may be out of range
+    if (col_base >= dims.N) {
         return;
     }
+
+    // Determine how many columns this workgroup actually processes (1-4)
+    let active_cols = min(COLS_PER_WG, dims.N - col_base);
 
     let a_offset = batch * dims.a_batch_stride;
     let b_offset = batch * dims.b_batch_stride;
     let c_offset = batch * dims.c_batch_stride;
 
-    // Each thread accumulates partial dot product over its slice of K.
-    // Thread tid processes k indices: tid*4, (tid+WG_SIZE)*4, (tid+2*WG_SIZE)*4, ...
-    // Each iteration handles 4 consecutive BF16 elements (2 packed u32 reads for A).
-    var partial_sum: f32 = 0.0;
+    // Each thread accumulates partial dot products for up to 4 columns.
+    // We process 8 consecutive BF16 elements from A per iteration (vec4<u32> = 8 BF16).
+    var sum0: f32 = 0.0;
+    var sum1: f32 = 0.0;
+    var sum2: f32 = 0.0;
+    var sum3: f32 = 0.0;
 
-    let num_vec4_chunks = dims.K / 4u;  // number of 4-element chunks in K
+    let num_vec8_chunks = dims.K / 8u;
 
-    // Vectorized loop: each thread strides by WG_SIZE across vec4 chunks
+    // Main vectorized loop: 8 BF16 values from A per iteration
     var ki: u32 = tid;
     loop {
-        if (ki >= num_vec4_chunks) {
+        if (ki >= num_vec8_chunks) {
             break;
         }
-        let k_base = ki * 4u;
+        let k_base = ki * 8u;
 
-        // Load 4 consecutive BF16 values from A vector (2 packed u32)
-        // A is row-major [1, K], so elements are contiguous: a_offset + k_base
+        // Load 8 consecutive BF16 values from A vector (4 packed u32)
+        // A is contiguous [1, K], so a_offset + k_base is aligned
         let a_packed_base = (a_offset + k_base) / 2u;
-        let a_packed0 = a[a_packed_base];
-        let a_packed1 = a[a_packed_base + 1u];
-        let a0 = bf16_to_f32(a_packed0 & 0xFFFFu);
-        let a1 = bf16_to_f32(a_packed0 >> 16u);
-        let a2 = bf16_to_f32(a_packed1 & 0xFFFFu);
-        let a3 = bf16_to_f32(a_packed1 >> 16u);
+        let ap0 = a[a_packed_base];
+        let ap1 = a[a_packed_base + 1u];
+        let ap2 = a[a_packed_base + 2u];
+        let ap3 = a[a_packed_base + 3u];
+        let av0 = unpack2(ap0);  // a[k_base+0], a[k_base+1]
+        let av1 = unpack2(ap1);  // a[k_base+2], a[k_base+3]
+        let av2 = unpack2(ap2);  // a[k_base+4], a[k_base+5]
+        let av3 = unpack2(ap3);  // a[k_base+6], a[k_base+7]
 
-        // Load B[k_base+i, col] for i=0..3.  B is row-major [K, N].
-        // b_idx = b_offset + (k_base+i) * N + col
-        let b_row_base = b_offset + k_base * dims.N + col;
-        let b_idx0 = b_row_base;
-        let b_idx1 = b_row_base + dims.N;
-        let b_idx2 = b_row_base + 2u * dims.N;
-        let b_idx3 = b_row_base + 3u * dims.N;
+        // For each of the 4 columns, load 8 B values and accumulate
+        // B[k, col] = b_offset + k * N + col (scattered across rows)
+        let b_base = b_offset + k_base * dims.N;
 
-        let b_packed0 = b[b_idx0 / 2u];
-        let b0 = select(bf16_to_f32(b_packed0 & 0xFFFFu), bf16_to_f32(b_packed0 >> 16u), (b_idx0 % 2u) == 1u);
+        // Column 0 (always active since col_base < N)
+        {
+            let col = col_base;
+            let b0 = read_b(b_base + col);
+            let b1 = read_b(b_base + dims.N + col);
+            let b2 = read_b(b_base + 2u * dims.N + col);
+            let b3 = read_b(b_base + 3u * dims.N + col);
+            let b4 = read_b(b_base + 4u * dims.N + col);
+            let b5 = read_b(b_base + 5u * dims.N + col);
+            let b6 = read_b(b_base + 6u * dims.N + col);
+            let b7 = read_b(b_base + 7u * dims.N + col);
+            sum0 += av0.x * b0 + av0.y * b1 + av1.x * b2 + av1.y * b3
+                  + av2.x * b4 + av2.y * b5 + av3.x * b6 + av3.y * b7;
+        }
 
-        let b_packed1 = b[b_idx1 / 2u];
-        let b1 = select(bf16_to_f32(b_packed1 & 0xFFFFu), bf16_to_f32(b_packed1 >> 16u), (b_idx1 % 2u) == 1u);
+        // Column 1
+        if (active_cols > 1u) {
+            let col = col_base + 1u;
+            let b0 = read_b(b_base + col);
+            let b1 = read_b(b_base + dims.N + col);
+            let b2 = read_b(b_base + 2u * dims.N + col);
+            let b3 = read_b(b_base + 3u * dims.N + col);
+            let b4 = read_b(b_base + 4u * dims.N + col);
+            let b5 = read_b(b_base + 5u * dims.N + col);
+            let b6 = read_b(b_base + 6u * dims.N + col);
+            let b7 = read_b(b_base + 7u * dims.N + col);
+            sum1 += av0.x * b0 + av0.y * b1 + av1.x * b2 + av1.y * b3
+                  + av2.x * b4 + av2.y * b5 + av3.x * b6 + av3.y * b7;
+        }
 
-        let b_packed2 = b[b_idx2 / 2u];
-        let b2 = select(bf16_to_f32(b_packed2 & 0xFFFFu), bf16_to_f32(b_packed2 >> 16u), (b_idx2 % 2u) == 1u);
+        // Column 2
+        if (active_cols > 2u) {
+            let col = col_base + 2u;
+            let b0 = read_b(b_base + col);
+            let b1 = read_b(b_base + dims.N + col);
+            let b2 = read_b(b_base + 2u * dims.N + col);
+            let b3 = read_b(b_base + 3u * dims.N + col);
+            let b4 = read_b(b_base + 4u * dims.N + col);
+            let b5 = read_b(b_base + 5u * dims.N + col);
+            let b6 = read_b(b_base + 6u * dims.N + col);
+            let b7 = read_b(b_base + 7u * dims.N + col);
+            sum2 += av0.x * b0 + av0.y * b1 + av1.x * b2 + av1.y * b3
+                  + av2.x * b4 + av2.y * b5 + av3.x * b6 + av3.y * b7;
+        }
 
-        let b_packed3 = b[b_idx3 / 2u];
-        let b3 = select(bf16_to_f32(b_packed3 & 0xFFFFu), bf16_to_f32(b_packed3 >> 16u), (b_idx3 % 2u) == 1u);
+        // Column 3
+        if (active_cols > 3u) {
+            let col = col_base + 3u;
+            let b0 = read_b(b_base + col);
+            let b1 = read_b(b_base + dims.N + col);
+            let b2 = read_b(b_base + 2u * dims.N + col);
+            let b3 = read_b(b_base + 3u * dims.N + col);
+            let b4 = read_b(b_base + 4u * dims.N + col);
+            let b5 = read_b(b_base + 5u * dims.N + col);
+            let b6 = read_b(b_base + 6u * dims.N + col);
+            let b7 = read_b(b_base + 7u * dims.N + col);
+            sum3 += av0.x * b0 + av0.y * b1 + av1.x * b2 + av1.y * b3
+                  + av2.x * b4 + av2.y * b5 + av3.x * b6 + av3.y * b7;
+        }
 
-        partial_sum = partial_sum + a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
-
-        ki = ki + WG_SIZE;
+        ki += WG_SIZE;
     }
 
-    // Handle remaining elements (K not divisible by 4)
-    // Only threads with tid < remainder do work; others keep partial_sum as-is.
-    let remainder_start = num_vec4_chunks * 4u;
+    // Handle remaining elements: K mod 8 (0..7 leftover elements)
+    // Process them one at a time, only threads with tid < remainder participate
+    let remainder_start = num_vec8_chunks * 8u;
     let k_remainder = dims.K - remainder_start;
     if (tid < k_remainder) {
         let kk = remainder_start + tid;
@@ -667,40 +735,99 @@ fn main(
         let a_packed = a[a_elem_idx / 2u];
         let a_val = select(bf16_to_f32(a_packed & 0xFFFFu), bf16_to_f32(a_packed >> 16u), (a_elem_idx % 2u) == 1u);
 
-        let b_elem_idx = b_offset + kk * dims.N + col;
-        let b_packed = b[b_elem_idx / 2u];
-        let b_val = select(bf16_to_f32(b_packed & 0xFFFFu), bf16_to_f32(b_packed >> 16u), (b_elem_idx % 2u) == 1u);
+        let b_row = b_offset + kk * dims.N;
 
-        partial_sum = partial_sum + a_val * b_val;
+        sum0 += a_val * read_b(b_row + col_base);
+
+        if (active_cols > 1u) {
+            sum1 += a_val * read_b(b_row + col_base + 1u);
+        }
+        if (active_cols > 2u) {
+            sum2 += a_val * read_b(b_row + col_base + 2u);
+        }
+        if (active_cols > 3u) {
+            sum3 += a_val * read_b(b_row + col_base + 3u);
+        }
     }
 
-    // Parallel reduction in shared memory.
-    // All 256 threads must participate in every barrier (WGSL requirement).
-    shared_partials[tid] = partial_sum;
+    // Parallel reduction in shared memory for all 4 columns.
+    // Layout: shared_partials[col_idx * 256 + tid]
+    shared_partials[tid] = sum0;
+    shared_partials[256u + tid] = sum1;
+    shared_partials[512u + tid] = sum2;
+    shared_partials[768u + tid] = sum3;
     workgroupBarrier();
 
-    // Tree reduction: 256 -> 128 -> 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
-    if (tid < 128u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 128u]; }
+    // Tree reduction: 256 -> 1 for each column simultaneously
+    if (tid < 128u) {
+        shared_partials[tid] += shared_partials[tid + 128u];
+        shared_partials[256u + tid] += shared_partials[256u + tid + 128u];
+        shared_partials[512u + tid] += shared_partials[512u + tid + 128u];
+        shared_partials[768u + tid] += shared_partials[768u + tid + 128u];
+    }
     workgroupBarrier();
-    if (tid < 64u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 64u]; }
+    if (tid < 64u) {
+        shared_partials[tid] += shared_partials[tid + 64u];
+        shared_partials[256u + tid] += shared_partials[256u + tid + 64u];
+        shared_partials[512u + tid] += shared_partials[512u + tid + 64u];
+        shared_partials[768u + tid] += shared_partials[768u + tid + 64u];
+    }
     workgroupBarrier();
-    if (tid < 32u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 32u]; }
+    if (tid < 32u) {
+        shared_partials[tid] += shared_partials[tid + 32u];
+        shared_partials[256u + tid] += shared_partials[256u + tid + 32u];
+        shared_partials[512u + tid] += shared_partials[512u + tid + 32u];
+        shared_partials[768u + tid] += shared_partials[768u + tid + 32u];
+    }
     workgroupBarrier();
-    if (tid < 16u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 16u]; }
+    if (tid < 16u) {
+        shared_partials[tid] += shared_partials[tid + 16u];
+        shared_partials[256u + tid] += shared_partials[256u + tid + 16u];
+        shared_partials[512u + tid] += shared_partials[512u + tid + 16u];
+        shared_partials[768u + tid] += shared_partials[768u + tid + 16u];
+    }
     workgroupBarrier();
-    if (tid < 8u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 8u]; }
+    if (tid < 8u) {
+        shared_partials[tid] += shared_partials[tid + 8u];
+        shared_partials[256u + tid] += shared_partials[256u + tid + 8u];
+        shared_partials[512u + tid] += shared_partials[512u + tid + 8u];
+        shared_partials[768u + tid] += shared_partials[768u + tid + 8u];
+    }
     workgroupBarrier();
-    if (tid < 4u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 4u]; }
+    if (tid < 4u) {
+        shared_partials[tid] += shared_partials[tid + 4u];
+        shared_partials[256u + tid] += shared_partials[256u + tid + 4u];
+        shared_partials[512u + tid] += shared_partials[512u + tid + 4u];
+        shared_partials[768u + tid] += shared_partials[768u + tid + 4u];
+    }
     workgroupBarrier();
-    if (tid < 2u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 2u]; }
+    if (tid < 2u) {
+        shared_partials[tid] += shared_partials[tid + 2u];
+        shared_partials[256u + tid] += shared_partials[256u + tid + 2u];
+        shared_partials[512u + tid] += shared_partials[512u + tid + 2u];
+        shared_partials[768u + tid] += shared_partials[768u + tid + 2u];
+    }
     workgroupBarrier();
-    if (tid < 1u) { shared_partials[tid] = shared_partials[tid] + shared_partials[tid + 1u]; }
+    if (tid < 1u) {
+        shared_partials[0u] += shared_partials[1u];
+        shared_partials[256u] += shared_partials[257u];
+        shared_partials[512u] += shared_partials[513u];
+        shared_partials[768u] += shared_partials[769u];
+    }
     workgroupBarrier();
 
-    // Thread 0 writes the final dot product result
+    // Thread 0 writes all active column results
     if (tid == 0u) {
-        let c_idx = c_offset + col;
-        c[c_idx] = shared_partials[0];
+        c[c_offset + col_base] = shared_partials[0u];
+        if (active_cols > 1u) {
+            c[c_offset + col_base + 1u] = shared_partials[256u];
+        }
+        if (active_cols > 2u) {
+            c[c_offset + col_base + 2u] = shared_partials[512u];
+        }
+        if (active_cols > 3u) {
+            c[c_offset + col_base + 3u] = shared_partials[768u];
+        }
     }
 }
 "#;

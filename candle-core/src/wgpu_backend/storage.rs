@@ -228,6 +228,7 @@ impl WgpuStorage {
     /// Specialized GEMV for m=1 BF16 matmul.
     /// A[b, 1, K] @ B[b, K, N] -> C[b, 1, N]
     /// Uses 256-thread workgroups with parallel reduction over K dimension.
+    /// Each workgroup computes 4 adjacent output columns (amortizes A vector loads).
     fn gemv_bf16_gpu(&self, rhs: &Self, b: usize, n: usize, k: usize) -> Result<Self> {
         let total_output_size = b * n; // m=1, so output is b*n
         let total_output_f32_bytes = total_output_size * std::mem::size_of::<f32>();
@@ -256,10 +257,12 @@ impl WgpuStorage {
             "gemv_bf16_dims",
         );
 
-        // 2D dispatch for large N (>65535): linearize col = wg_id.x + wg_id.y * num_wg.x
-        let total_cols = n as u32;
-        let workgroups_x = total_cols.min(65535);
-        let workgroups_y = (total_cols + workgroups_x - 1) / workgroups_x;
+        // Each workgroup computes 4 adjacent output columns (COLS_PER_WG=4 in shader).
+        // 2D dispatch for large N (>65535): linearize col_group = wg_id.x + wg_id.y * num_wg.x
+        let cols_per_wg = 4u32;
+        let num_col_groups = (n as u32 + cols_per_wg - 1) / cols_per_wg;
+        let workgroups_x = num_col_groups.min(65535);
+        let workgroups_y = (num_col_groups + workgroups_x - 1) / workgroups_x;
         let workgroups_z = b as u32;
 
         self.device.with_pipeline(ShaderType::GemvBF16, |cached| {
