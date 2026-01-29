@@ -1610,6 +1610,81 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
+/// Fused SiLU(gate) * up for BF16 MLP gate
+/// Input: two BF16 buffers (gate, up) of same size
+/// Output: one BF16 buffer
+/// Each thread processes a pair of elements:
+///   output[i] = silu(gate[i]) * up[i]
+///   silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+/// Fuses two dispatches (unary silu + binary mul) into one.
+pub const FUSED_SILU_MUL_BF16_SHADER: &str = r#"
+// Fused SiLU(gate) * up for BF16 MLP gate projection
+// gate, up: BF16 packed as u32 (2 BF16 per u32)
+// output: BF16 packed as u32
+
+@group(0) @binding(0) var<storage, read> gate: array<u32>;
+@group(0) @binding(1) var<storage, read> up: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<u32>;
+
+struct Params {
+    elem_count: u32,
+    gate_offset: u32,
+    up_offset: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(3) var<uniform> params: Params;
+
+fn bf16_to_f32(bits: u32) -> f32 {
+    return bitcast<f32>(bits << 16u);
+}
+
+fn f32_to_bf16(val: f32) -> u32 {
+    return bitcast<u32>(val) >> 16u;
+}
+
+fn read_gate_bf16(idx: u32) -> f32 {
+    let packed = gate[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+fn read_up_bf16(idx: u32) -> f32 {
+    let packed = up[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+fn sigmoid(x: f32) -> f32 {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let pair_idx = global_id.x;
+    let elem_idx = pair_idx * 2u;
+
+    if (elem_idx >= params.elem_count) {
+        return;
+    }
+
+    // First element of pair
+    let g0 = read_gate_bf16(params.gate_offset + elem_idx);
+    let u0 = read_up_bf16(params.up_offset + elem_idx);
+    let r0 = f32_to_bf16(g0 * sigmoid(g0) * u0);
+
+    // Second element of pair (bounds-checked)
+    var r1: u32 = 0u;
+    if (elem_idx + 1u < params.elem_count) {
+        let g1 = read_gate_bf16(params.gate_offset + elem_idx + 1u);
+        let u1 = read_up_bf16(params.up_offset + elem_idx + 1u);
+        r1 = f32_to_bf16(g1 * sigmoid(g1) * u1);
+    }
+
+    output[elem_idx / 2u] = r0 | (r1 << 16u);
+}
+"#;
+
 /// BF16 Layer Normalization shader
 /// Input: BF16 packed as u32 (2 BF16 per u32, little-endian)
 /// Gamma, Beta: BF16 packed as u32

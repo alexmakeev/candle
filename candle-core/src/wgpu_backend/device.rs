@@ -48,6 +48,7 @@ pub enum ShaderType {
     RopeBF16,
     IndexSelectBF16,
     GemvBF16,
+    FusedSiluMulBF16,
 }
 
 /// Unique identifier for a wgpu device
@@ -231,6 +232,7 @@ impl WgpuDevice {
             ShaderType::RopeBF16 => (ops::ROPE_BF16_SHADER, "rope_bf16"),
             ShaderType::IndexSelectBF16 => (ops::INDEX_SELECT_BF16_SHADER, "index_select_bf16"),
             ShaderType::GemvBF16 => (ops::GEMV_BF16_SHADER, "gemv_bf16"),
+            ShaderType::FusedSiluMulBF16 => (ops::FUSED_SILU_MUL_BF16_SHADER, "fused_silu_mul_bf16"),
         };
 
         let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -383,12 +385,12 @@ impl WgpuDevice {
                     ],
                 })
             }
-            ShaderType::BinaryBF16 => {
+            ShaderType::BinaryBF16 | ShaderType::FusedSiluMulBF16 => {
                 self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some(&format!("{}_bind_group_layout", label)),
                     entries: &[
-                        storage_entry(0, true),  // lhs
-                        storage_entry(1, true),  // rhs
+                        storage_entry(0, true),  // lhs / gate
+                        storage_entry(1, true),  // rhs / up
                         storage_entry(2, false), // output
                         uniform_entry(3),        // params
                     ],
