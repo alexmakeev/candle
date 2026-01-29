@@ -580,8 +580,14 @@ fn f32_to_bf16(val: f32) -> u32 {
     return bitcast<u32>(val) >> 16u;
 }
 
-fn read_bf16(buf: ptr<storage, array<u32>, read>, idx: u32) -> f32 {
-    let packed = (*buf)[idx / 2u];
+fn read_lhs_bf16(idx: u32) -> f32 {
+    let packed = lhs[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+fn read_rhs_bf16(idx: u32) -> f32 {
+    let packed = rhs[idx / 2u];
     let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
     return bf16_to_f32(bits);
 }
@@ -607,14 +613,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    let a0 = read_bf16(&lhs, params.lhs_offset + elem_idx);
-    let b0 = read_bf16(&rhs, params.rhs_offset + elem_idx);
+    let a0 = read_lhs_bf16(params.lhs_offset + elem_idx);
+    let b0 = read_rhs_bf16(params.rhs_offset + elem_idx);
     let r0 = f32_to_bf16(apply_op(a0, b0));
 
     var r1: u32 = 0u;
     if (elem_idx + 1u < params.elem_count) {
-        let a1 = read_bf16(&lhs, params.lhs_offset + elem_idx + 1u);
-        let b1 = read_bf16(&rhs, params.rhs_offset + elem_idx + 1u);
+        let a1 = read_lhs_bf16(params.lhs_offset + elem_idx + 1u);
+        let b1 = read_rhs_bf16(params.rhs_offset + elem_idx + 1u);
         r1 = f32_to_bf16(apply_op(a1, b1));
     }
 
@@ -1082,8 +1088,8 @@ struct Params {
 
 @group(0) @binding(2) var<uniform> params: Params;
 
-fn bf16_read(buf: ptr<storage, array<u32>, read>, idx: u32) -> u32 {
-    let packed = (*buf)[idx / 2u];
+fn bf16_read_src(idx: u32) -> u32 {
+    let packed = src[idx / 2u];
     return select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
 }
 
@@ -1113,13 +1119,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // First element
     let src_idx_0 = flat_to_strided_idx(pair_idx * 2u);
-    let low = bf16_read(&src, src_idx_0);
+    let low = bf16_read_src(src_idx_0);
 
     // Second element (if exists)
     var high: u32 = 0u;
     if (pair_idx * 2u + 1u < params.elem_count) {
         let src_idx_1 = flat_to_strided_idx(pair_idx * 2u + 1u);
-        high = bf16_read(&src, src_idx_1);
+        high = bf16_read_src(src_idx_1);
     }
 
     dst[out_elem_0 / 2u] = low | (high << 16u);
@@ -1202,8 +1208,14 @@ fn f32_to_bf16(val: f32) -> u32 {
     return bitcast<u32>(val) >> 16u;
 }
 
-fn read_bf16(buf: ptr<storage, array<u32>, read>, idx: u32) -> f32 {
-    let packed = (*buf)[idx / 2u];
+fn read_input_bf16(idx: u32) -> f32 {
+    let packed = input[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+fn read_alpha_bf16(idx: u32) -> f32 {
+    let packed = alpha[idx / 2u];
     let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
     return bf16_to_f32(bits);
 }
@@ -1226,7 +1238,7 @@ fn main(
     var local_sum_sq: f32 = 0.0;
     var i: u32 = local_idx;
     while (i < params.hidden_size) {
-        let val = read_bf16(&input, row_offset + i);
+        let val = read_input_bf16(row_offset + i);
         local_sum_sq += val * val;
         i += 256u;
     }
@@ -1247,49 +1259,20 @@ fn main(
     let rms_inv = inverseSqrt(shared_data[0] / f32(params.hidden_size) + params.eps);
     workgroupBarrier();
 
-    // Phase 2: Normalize and scale by alpha, write BF16 output
+    // Phase 2: Normalize and scale by alpha, write BF16 output (pair-based)
     let out_row_offset = row_idx * params.hidden_size;
-    i = local_idx;
-    while (i < params.hidden_size) {
-        let val = read_bf16(&input, row_offset + i);
-        let alpha_val = read_bf16(&alpha, i);
-        let normed = val * rms_inv * alpha_val;
-
-        // Write BF16 packed u32 — handle pairs
-        // Each element writes to its half of the u32
-        let out_idx = out_row_offset + i;
-        let packed_idx = out_idx / 2u;
-        let is_high = (out_idx % 2u) == 1u;
-        let bf16_val = f32_to_bf16(normed);
-
-        // Since threads process different elements strided by 256, two threads
-        // might write to the same u32. Use atomicOr would be ideal but not available.
-        // Instead, process pairs: handle i and i+1 together if both are in range
-        // Simpler: write one element at a time using output as f32 temporarily,
-        // then convert. But that wastes memory.
-        // Simplest correct approach: each thread handles elements at stride 256,
-        // so consecutive threads never share a u32 (stride >= 2).
-        // Wait — i jumps by 256, so i and i+256 are far apart. No conflict.
-        // But i and i+1 (from different threads with local_idx differing by 1)
-        // DO share a u32!
-
-        // Solution: process in pairs. Thread handles 2 consecutive elements.
-        i += 256u;
-    }
-    // Rewrite: each thread processes pairs of consecutive elements
-    workgroupBarrier();
     i = local_idx * 2u;
     while (i < params.hidden_size) {
         let out_idx = out_row_offset + i;
 
-        let val0 = read_bf16(&input, row_offset + i);
-        let alpha0 = read_bf16(&alpha, i);
+        let val0 = read_input_bf16(row_offset + i);
+        let alpha0 = read_alpha_bf16(i);
         let r0 = f32_to_bf16(val0 * rms_inv * alpha0);
 
         var r1: u32 = 0u;
         if (i + 1u < params.hidden_size) {
-            let val1 = read_bf16(&input, row_offset + i + 1u);
-            let alpha1 = read_bf16(&alpha, i + 1u);
+            let val1 = read_input_bf16(row_offset + i + 1u);
+            let alpha1 = read_alpha_bf16(i + 1u);
             r1 = f32_to_bf16(val1 * rms_inv * alpha1);
         }
 
@@ -1331,8 +1314,20 @@ fn bf16_to_f32(bits: u32) -> f32 {
     return bitcast<f32>(bits << 16u);
 }
 
-fn read_bf16(buf: ptr<storage, array<u32>, read>, idx: u32) -> f32 {
-    let packed = (*buf)[idx / 2u];
+fn read_src_bf16(idx: u32) -> f32 {
+    let packed = src[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+fn read_cos_bf16(idx: u32) -> f32 {
+    let packed = cos_buf[idx / 2u];
+    let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
+    return bf16_to_f32(bits);
+}
+
+fn read_sin_bf16(idx: u32) -> f32 {
+    let packed = sin_buf[idx / 2u];
     let bits = select(packed & 0xFFFFu, packed >> 16u, (idx % 2u) == 1u);
     return bf16_to_f32(bits);
 }
@@ -1364,10 +1359,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let i_cs = params.cos_offset + cs_offset + t_idx * half_d + i_d;
     let i_ss = params.sin_offset + cs_offset + t_idx * half_d + i_d;
 
-    let x1 = read_bf16(&src, i1);
-    let x2 = read_bf16(&src, i2);
-    let cos_val = read_bf16(&cos_buf, i_cs);
-    let sin_val = read_bf16(&sin_buf, i_ss);
+    let x1 = read_src_bf16(i1);
+    let x2 = read_src_bf16(i2);
+    let cos_val = read_cos_bf16(i_cs);
+    let sin_val = read_sin_bf16(i_ss);
 
     // Write F32 output (no u32 packing race condition)
     let out_base = bh_idx * params.td;
