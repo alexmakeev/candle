@@ -160,6 +160,44 @@ fn test_odd_count(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn test_linear_matmul(device: &Device) -> Result<()> {
+    // Simulate Linear layer: x @ w.t() where w is [out_dim, in_dim]
+    // This tests that pre-transposed contiguous weights work correctly
+    let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 3), device)?.to_dtype(DType::BF16)?;
+    let w = Tensor::from_vec(
+        vec![1.0f32, 0.0, 0.0,  // row 0
+             0.0, 1.0, 0.0],    // row 1
+        (2, 3),
+        device,
+    )?.to_dtype(DType::BF16)?;
+
+    // Method 1: w.t() (non-contiguous) — the old way
+    let wt = w.t()?;
+    assert!(!wt.is_contiguous(), "transposed weight should be non-contiguous");
+    let r1 = x.matmul(&wt)?.to_dtype(DType::F32)?.to_vec2::<f32>()?.into_iter().flatten().collect::<Vec<_>>();
+
+    // Method 2: w.t().contiguous() (contiguous) — the new way via weight_t
+    let wt_contig = wt.contiguous()?;
+    assert!(wt_contig.is_contiguous(), "contiguous weight should be contiguous");
+    let r2 = x.matmul(&wt_contig)?.to_dtype(DType::F32)?.to_vec2::<f32>()?.into_iter().flatten().collect::<Vec<_>>();
+
+    // Expected: x @ w.t() = [1,2,3] @ [[1,0],[0,1],[0,0]] = [1, 2]
+    let expected = vec![1.0, 2.0];
+    for (i, (e, g)) in expected.iter().zip(r1.iter()).enumerate() {
+        assert!((e - g).abs() < 0.5, "linear_non_contig[{i}]: expected {e}, got {g}");
+    }
+    for (i, (e, g)) in expected.iter().zip(r2.iter()).enumerate() {
+        assert!((e - g).abs() < 0.5, "linear_contig[{i}]: expected {e}, got {g}");
+    }
+    // Both methods must produce same result
+    for (i, (a, b)) in r1.iter().zip(r2.iter()).enumerate() {
+        assert!((a - b).abs() < 0.01, "linear_match[{i}]: non_contig={a}, contig={b}");
+    }
+
+    eprintln!("[OK] linear matmul BF16 (non-contiguous vs contiguous weight)");
+    Ok(())
+}
+
 fn test_copy_strided(device: &Device) -> Result<()> {
     let data = Tensor::from_vec(
         vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -197,6 +235,7 @@ fn main() {
         ("affine", Box::new(test_affine)),
         ("copy_strided_f32", Box::new(test_copy_strided_f32)),
         ("copy_strided", Box::new(test_copy_strided)),
+        ("linear_matmul", Box::new(test_linear_matmul)),
         ("odd_count", Box::new(test_odd_count)),
     ];
 

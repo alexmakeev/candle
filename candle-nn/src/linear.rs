@@ -23,11 +23,17 @@ use candle::{Result, Tensor};
 pub struct Linear {
     weight: Tensor,
     bias: Option<Tensor>,
+    /// Pre-transposed contiguous weight for efficient matmul on wgpu backend.
+    /// Avoids creating non-contiguous tensors via .t() on every forward pass.
+    weight_t: Option<Tensor>,
 }
 
 impl Linear {
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight, bias }
+        // Pre-compute transposed contiguous weight for backends that need contiguous inputs
+        // (notably wgpu). This is a one-time cost at model load vs per-forward-call overhead.
+        let weight_t = weight.t().ok().and_then(|wt| wt.contiguous().ok());
+        Self { weight, bias, weight_t }
     }
 
     pub fn weight(&self) -> &Tensor {
@@ -36,6 +42,14 @@ impl Linear {
 
     pub fn bias(&self) -> Option<&Tensor> {
         self.bias.as_ref()
+    }
+
+    /// Returns the pre-transposed contiguous weight, or computes it on the fly.
+    fn weight_t(&self) -> candle::Result<Tensor> {
+        match &self.weight_t {
+            Some(wt) => Ok(wt.clone()),
+            None => self.weight.t(),
+        }
     }
 }
 
@@ -46,7 +60,7 @@ impl super::Module for Linear {
         let x = match *x.dims() {
             [b1, b2, m, k] => {
                 if x.is_contiguous() {
-                    let w = self.weight.t()?;
+                    let w = self.weight_t()?;
                     x.reshape((b1 * b2 * m, k))?
                         .matmul(&w)?
                         .reshape((b1, b2, m, ()))?
@@ -57,7 +71,7 @@ impl super::Module for Linear {
             }
             [bsize, m, k] => {
                 if x.is_contiguous() {
-                    let w = self.weight.t()?;
+                    let w = self.weight_t()?;
                     x.reshape((bsize * m, k))?
                         .matmul(&w)?
                         .reshape((bsize, m, ()))?
@@ -67,7 +81,7 @@ impl super::Module for Linear {
                 }
             }
             _ => {
-                let w = self.weight.t()?;
+                let w = self.weight_t()?;
                 x.matmul(&w)?
             }
         };
