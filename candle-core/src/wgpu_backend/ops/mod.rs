@@ -1123,8 +1123,10 @@ fn flat_to_src(flat: u32) -> u32 {
 }
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let pair_idx = global_id.x;
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>) {
+    // 2D dispatch: linearize global_id for >65535 workgroup support
+    let pair_idx = global_id.x + global_id.y * num_wg.x * 256u;
     let out_elem_0 = params.dst_offset + pair_idx * 2u;
 
     if (out_elem_0 >= params.dst_offset + params.elem_count) {
@@ -1198,8 +1200,10 @@ fn flat_to_src(flat: u32) -> u32 {
 }
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let flat_idx = global_id.x;
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>) {
+    // 2D dispatch: linearize global_id for >65535 workgroup support
+    let flat_idx = global_id.x + global_id.y * num_wg.x * 256u;
 
     if (flat_idx >= params.elem_count) {
         return;

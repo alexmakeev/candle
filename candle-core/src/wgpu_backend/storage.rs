@@ -1157,7 +1157,10 @@ impl WgpuStorage {
             }
         };
 
-        let workgroups = ((elem_count as u32) + 255) / 256;
+        let total_workgroups = ((elem_count as u32) + 255) / 256;
+        // Use 2D dispatch to stay within 65535 limit per dimension
+        let wg_x = total_workgroups.min(65535);
+        let wg_y = (total_workgroups + wg_x - 1) / wg_x;
 
         self.device.with_pipeline(shader_type, |cached| {
             let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1190,7 +1193,7 @@ impl WgpuStorage {
                 });
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(workgroups, 1, 1);
+                pass.dispatch_workgroups(wg_x, wg_y, 1);
             }
 
             self.device.queue().submit(std::iter::once(encoder.finish()));
@@ -1807,13 +1810,16 @@ impl BackendStorage for WgpuStorage {
             }
         };
 
-        let workgroups = match self.dtype {
+        let total_workgroups = match self.dtype {
             DType::BF16 => {
                 let num_pairs = (elem_count + 1) / 2;
                 ((num_pairs as u32) + 255) / 256
             }
             _ => ((elem_count as u32) + 255) / 256,
         };
+        // Use 2D dispatch to stay within 65535 limit per dimension
+        let wg_x = total_workgroups.min(65535);
+        let wg_y = (total_workgroups + wg_x - 1) / wg_x;
 
         self.device.with_pipeline(shader_type, |cached| {
             let bind_group = self.device.device().create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1846,7 +1852,7 @@ impl BackendStorage for WgpuStorage {
                 });
                 pass.set_pipeline(&cached.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(workgroups, 1, 1);
+                pass.dispatch_workgroups(wg_x, wg_y, 1);
             }
 
             self.device.queue().submit(std::iter::once(encoder.finish()));
